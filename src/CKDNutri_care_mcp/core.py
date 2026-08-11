@@ -27,7 +27,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from a207_policy import (
+from ._policy import (
     FOLLOWUP_CLINICIAN,
     FOLLOWUP_WRITE_ALLOWED,
     NOTIFY_READ_ROLES,

@@ -98,7 +98,7 @@ def get_pew_timeline_tool(
 @mcp.tool
 def get_notifications_tool(
     patient_id: str,
-    status: Optional[str] = None,
+    status: Optional[str] = "all",
 ) -> dict[str, Any]:
     """查通知列表（可按 status/ack 过滤，含 workflow_status 闭环字段）。"""
     try:
@@ -124,21 +124,18 @@ def trigger_event_notification_tool(
     patient_id: str,
     payload: Optional[dict] = None,
 ) -> dict[str, Any]:
-    """事件触发的通知创建：事件类型→模板填充→落库→推送 一键完成。
+    """事件触发的通知创建：事件类型→模板填充→落库→推送 一键完成（DAG）。
 
-    event_type: followup_due / lab_critical / risk_l2 / risk_l3
-    内部串联 build_event_notification → create_notification。
-    原 2 次调用→1 次；由 HAIP Workflow 纯代码驱动。
+    event_type: followup_due / risk_escalation / report_ready
+    payload 按事件类型填字段：
+      - followup_due: {next_due_date(, due_at)}
+      - risk_escalation: {from_level, to_level, rule}
+      - report_ready: {}（无需额外字段）
+    内部由 build_event_notification 完成模板填充 + 落库（已含 create_notification），
+    本工具直接返回其结果，不再二次写库（修复 v0.3.1 重复写库 + 非法 kwarg 崩溃）。
     """
     try:
-        r = build_event_notification(event_type, patient_id, payload or {})
-        if not r.get("ok"):
-            return r
-        n = create_notification(
-            patient_id=patient_id if "patient_id" in r.get("notification", {}) else r["notification"]["patient_id"],
-            **{k: v for k, v in r["notification"].items() if k != "patient_id"},
-        )
-        return n
+        return build_event_notification(event_type, patient_id, payload or {})
     except Exception as exc:
         return _invalid(exc)
 

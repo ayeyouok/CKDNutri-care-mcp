@@ -30,6 +30,8 @@ from typing import Any
 from a207_policy import (
     FOLLOWUP_CLINICIAN,
     FOLLOWUP_WRITE_ALLOWED,
+    NOTIFY_READ_ROLES,
+    NOTIFY_WRITE_ROLES,
     atomic_write_json,
     enforce_read,
     enforce_write,
@@ -47,6 +49,72 @@ MCP_NAME = "CKDNutri-care-mcp"
 _WRITE_ALLOWED = FOLLOWUP_WRITE_ALLOWED
 # 临床角色可见原始医生备注；患者/家属角色仅可见摘要
 _CLINICIAN = FOLLOWUP_CLINICIAN
+
+# ---------------------------------------------------------------------------
+# M10 通知引擎支持块（与随访存储隔离，避免 key 命名空间污染）
+# ---------------------------------------------------------------------------
+# 通知写权限：仅临床助手/风险管线（NOTIFY_WRITE_ROLES = {doctor, risk}）
+_WRITE_ROLES = NOTIFY_WRITE_ROLES
+# 通知读权限：临床/家庭/风险均可读自己患者的通知
+_READ_ROLES = NOTIFY_READ_ROLES
+
+_NOTIFY_STORE_FILENAME = "notification_store.json"
+_NOTIFY_DATA_DIR_ENV = "A207_NOTIFICATION_DATA_DIR"
+
+
+def _notify_store_path() -> Path:
+    """通知写库路径：A207_NOTIFICATION_DATA_DIR override，否则落到 A207_DATA_DIR。"""
+    override = os.environ.get(_NOTIFY_DATA_DIR_ENV)
+    if override:
+        return Path(override) / _NOTIFY_STORE_FILENAME
+    return resolve_state_path(_NOTIFY_STORE_FILENAME)
+
+
+def _notify_load() -> dict[str, Any]:
+    try:
+        with open(_notify_store_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _notify_save(store: dict[str, Any]) -> None:
+    # OD-014：原子写，避免半写截断静默丢数据
+    atomic_write_json(_notify_store_path(), store)
+
+
+def _forbidden(role: str, action: str) -> dict[str, Any]:
+    return {"ok": False, "error": "FORBIDDEN",
+            "detail": f"caller={role} 无权执行 {action}（P3 权限矩阵）"}
+
+
+# 末端事件 -> 通知模板（零跨包 import：事件数据由编排层经 payload 传入）
+_EVENT_TEMPLATES: dict[str, dict[str, str]] = {
+    "followup_due": {
+        "category": "followup_due",
+        "priority": "high",
+        "title": "随访到期提醒",
+        "body_tmpl": "患者 {patient_id} 的随访计划将于 {next_due_date} 到期，请及时预约就诊。",
+    },
+    "risk_escalation": {
+        "category": "risk_alert",
+        "priority": "high",
+        "title": "风险等级升高预警",
+        "body_tmpl": "风险等级由 {from_level} 升至 {to_level}（依据 {rule}），请关注并复核。",
+    },
+    "report_ready": {
+        "category": "report_ready",
+        "priority": "medium",
+        "title": "营养评估报告已生成",
+        "body_tmpl": "患者 {patient_id} 的定期营养评估报告已生成，可前往查看完整报告。",
+    },
+}
+
+_SOURCE_MAP = {
+    "followup_due": "M4:next_due",
+    "risk_escalation": "M8:risk_level",
+    "report_ready": "M9:report",
+}
 
 # ---------------------------------------------------------------------------
 # KDIGO 2024 儿科随访频率（recommend_followup_interval）
@@ -361,7 +429,7 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     caller = get_caller()
     if caller not in _WRITE_ROLES:
         return _forbidden(caller, "create_notification")
-    store = _load_store()
+    store = _notify_load()
     nid = "N" + uuid.uuid4().hex[:12].upper()
     rec = {
         "id": nid,
@@ -376,7 +444,7 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
         "status": "unacked",
     }
     store[nid] = rec
-    _save_store(store)
+    _notify_save(store)
     return {"ok": True, "notification": rec}
 
 
@@ -412,7 +480,7 @@ def get_notifications(patient_id: str,
     caller = get_caller()
     if caller not in _READ_ROLES:
         return _forbidden(caller, "get_notifications")
-    store = _load_store()
+    store = _notify_load()
     items = [r for r in store.values()
              if r["patient_id"] == patient_id and (status == "all" or r["status"] == status)]
     items.sort(key=lambda r: r["created_at"], reverse=True)
@@ -427,12 +495,12 @@ def ack_notification(notification_id: str) -> dict[str, Any]:
     caller = get_caller()
     if caller not in _READ_ROLES:
         return _forbidden(caller, "ack_notification")
-    store = _load_store()
+    store = _notify_load()
     rec = store.get(notification_id)
     if rec is None:
         return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {notification_id} 不存在"}
     rec["status"] = "acked"
-    _save_store(store)
+    _notify_save(store)
     return {"ok": True, "notification": rec}
 
 # ================================================================
@@ -440,33 +508,32 @@ def ack_notification(notification_id: str) -> dict[str, Any]:
 # ================================================================
 
 def update_notification_status(notification_id: str, new_status: str,
-                                resolution_note: str = "") -> dict:
+                                resolution_note: str = "") -> dict[str, Any]:
     """推移风险闭环状态机。仅 CKD 临床助手。
 
-    校验：状态只能正向流转 unacked→confirmed→resolved→closed；
-    confirmed↔resolved 需要 resolution_note。
+    状态正向流转（与 ack/通知共用同一 status 字段）：
+    unacked → acked → confirmed → resolved → closed。
+    acked 由 ack_notification 设置；confirm/resolve/close 由本工具推进。
     """
-    from a207_policy import enforce_write, get_caller
     caller = get_caller()
     enforce_write('CKDNutri-care-mcp', tool='update_notification_status')
-    ALLOWED = {"confirmed", "resolved", "closed"}
+    ALLOWED = {"unacked", "acked", "confirmed", "resolved", "closed"}
     if new_status not in ALLOWED:
         return {"ok": False, "error": "INVALID_STATUS", "detail": f"status must be one of {ALLOWED}"}
-    store = _load_store()
+    store = _notify_load()
     nid = notification_id.strip()
-    notifications = store.setdefault("notifications", [])
-    for i, n in enumerate(notifications):
-        if n.get("id") == nid:
-            current = n.get("workflow_status", "unacked")
-            ORDER = ["unacked", "confirmed", "resolved", "closed"]
-            if ORDER.index(new_status) <= ORDER.index(current) and new_status != current:
-                return {"ok": False, "error": "INVALID_TRANSITION",
-                        "detail": f"Cannot go from {current} to {new_status}"}
-            n["workflow_status"] = new_status
-            n["status_updated_by"] = caller
-            n["status_updated_at"] = __import__("datetime").datetime.now().isoformat()
-            if new_status == "resolved" and resolution_note:
-                n["resolution_note"] = resolution_note
-            _save_store(store)
-            return {"ok": True, "notification": n}
-    return {"ok": False, "error": "NOT_FOUND"}
+    rec = store.get(nid)
+    if rec is None:
+        return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
+    current = rec.get("status", "unacked")
+    ORDER = ["unacked", "acked", "confirmed", "resolved", "closed"]
+    if new_status != current and ORDER.index(new_status) <= ORDER.index(current):
+        return {"ok": False, "error": "INVALID_TRANSITION",
+                "detail": f"Cannot go from {current} to {new_status}"}
+    rec["status"] = new_status
+    rec["status_updated_by"] = caller
+    rec["status_updated_at"] = datetime.now().isoformat()
+    if new_status == "resolved" and resolution_note:
+        rec["resolution_note"] = resolution_note
+    _notify_save(store)
+    return {"ok": True, "notification": rec}

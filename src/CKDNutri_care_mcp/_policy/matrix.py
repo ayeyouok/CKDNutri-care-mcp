@@ -60,7 +60,7 @@ CLINICIAN_ONLY_FIELDS: frozenset[str] = frozenset({
 # 上述字段「绝不可见」的角色（家庭助手）。M9 报告层据此做受限脱敏（OD-013）。
 CLINICIAN_ONLY_HIDDEN_FROM: frozenset[str] = frozenset({"parent_assistant"})
 
-# ---------------------------------------------------------------- 权限矩阵（v2.3 阶段 0：3 角色 × 12 MCP）
+# ---------------------------------------------------------------- 权限矩阵（v2.3 阶段 0：3 角色 × 5 MCP，CKDNutri P1–P5）
 
 ACCESS_NONE = "-"
 ACCESS_READ = "R"
@@ -71,65 +71,45 @@ _READ_OK: frozenset[str] = frozenset({ACCESS_READ, ACCESS_LIMITED, ACCESS_RW})
 
 PERMISSION_MATRIX: dict[str, dict[str, str]] = {
     "CKDNutri-clinical-data-mcp": {
-        "doctor_assistant": ACCESS_READ,
-        "parent_assistant": ACCESS_LIMITED,
-        "risk_warning": ACCESS_READ,
-    },
-    "CKDNutri-clinical-data-mcp": {
+        # doctor=R/W：临床助手可读写患儿档案与化验
+        # parent=RL：家庭助手仅受限视图（脱敏）
+        # risk=R：风险引擎读分期/化验
         "doctor_assistant": ACCESS_RW,
         "parent_assistant": ACCESS_LIMITED,
         "risk_warning": ACCESS_READ,
     },
     "CKDNutri-nutrition-mcp": {
+        # doctor=R：临床角色读营养数据 + 跑计算面工具（CLINICAL_ROLES 单独收口）
+        # parent=R/W：写饮食日记(upsert_food_diary) 且需回读日记摘要 —— 与 WRITE_TOOL_POLICY 一致
+        # risk=-：风险引擎不读营养域
         "doctor_assistant": ACCESS_READ,
-        "parent_assistant": ACCESS_LIMITED,
-        "risk_warning": ACCESS_READ,
-    },
-    "CKDNutri-care-mcp": {
-        "doctor_assistant": ACCESS_RW,
-        "parent_assistant": ACCESS_LIMITED,
-        "risk_warning": ACCESS_READ,
-    },
-    "CKDNutri-nutrition-mcp": {
-        "doctor_assistant": ACCESS_READ,
-        "parent_assistant": ACCESS_READ,
+        "parent_assistant": ACCESS_RW,
         "risk_warning": ACCESS_NONE,
-    },
-    "CKDNutri-assessment-mcp": {
-        "doctor_assistant": ACCESS_READ,
-        "parent_assistant": ACCESS_NONE,
-        "risk_warning": ACCESS_NONE,
-    },
-    "CKDNutri-nutrition-mcp": {
-        "doctor_assistant": ACCESS_READ,
-        "parent_assistant": ACCESS_NONE,
-        "risk_warning": ACCESS_NONE,
-    },
-    "CKDNutri-assessment-mcp": {
-        "doctor_assistant": ACCESS_READ,
-        "parent_assistant": ACCESS_NONE,
-        "risk_warning": ACCESS_READ,
-    },
-    "CKDNutri-content-mcp": {
-        "doctor_assistant": ACCESS_RW,
-        "parent_assistant": ACCESS_LIMITED,
-        "risk_warning": ACCESS_READ,
     },
     "CKDNutri-care-mcp": {
         # doctor=R/W：临床助手可创建/确认通知
-        # parent=READ：家庭助手读通知（含闭环状态查看）
+        # parent=R：家庭助手读通知（含闭环状态查看）
         # risk=R/W：管线身份写通知（notify_* 系列由 WRITE_TOOL_POLICY 钳制为 {risk_warning}）
         "doctor_assistant": ACCESS_RW,
         "parent_assistant": ACCESS_READ,
         "risk_warning": ACCESS_RW,
     },
-    # M11 退役（打卡并入 M3 upsert_food_diary）
-    "CKDNutri-content-mcp": {
+    "CKDNutri-assessment-mcp": {
+        # doctor=R：读 eGFR / 分期
+        # parent=-：分期类问题由家庭助手读 M1 已确诊分期（MX-1），不暴露评估域
+        # risk=R：风险引擎读分期
         "doctor_assistant": ACCESS_READ,
+        "parent_assistant": ACCESS_NONE,
+        "risk_warning": ACCESS_READ,
+    },
+    "CKDNutri-content-mcp": {
+        # doctor=R/W：报告生成 + push_to_emr 需 R/W 回查
+        # parent=RL：受限报告视图
+        # risk=R：风险引擎读报告上下文
+        "doctor_assistant": ACCESS_RW,
         "parent_assistant": ACCESS_LIMITED,
         "risk_warning": ACCESS_READ,
     },
-    # M13 router 退出 MCP 统计（P0 网关回归 HTTP 中间件）
 }
 
 # M12 按角色切语料 profile（v2.3 阶段 0：删 nutritionist/child_companion）
@@ -273,7 +253,9 @@ FOLLOWUP_WRITE_ALLOWED: frozenset[str] = _matrix_writers("CKDNutri-care-mcp")  #
 FOLLOWUP_CLINICIAN: frozenset[str] = frozenset({"doctor_assistant", "risk_warning"})
 
 # --- M3 营养评估 工具级 ACL ---
-NUTRITION_ASSESSMENT_WRITE_ALLOWED: frozenset[str] = frozenset({"parent_assistant"})
+# OD-011 收口：写白名单唯一事实源=矩阵，不允许手写更宽集合（与 LIS/FOLLOWUP 一致）。
+# 矩阵 nutrition×parent=R/W ⇒ 这里自然得出 {parent_assistant}。
+NUTRITION_ASSESSMENT_WRITE_ALLOWED: frozenset[str] = _matrix_writers("CKDNutri-nutrition-mcp")
 NUTRITION_ASSESSMENT_DATA_TOOLS: frozenset[str] = frozenset({
     "upsert_food_diary",
     "get_food_diary_summary",

@@ -1,12 +1,12 @@
 """a207-policy —— A207 统一身份注入 / 权限矩阵 / 状态路径策略包。
 
-Plan A 单一事实源。13 个 MCP 统一依赖本包：
+Plan A 单一事实源。5 个 CKDNutri MCP (P1–P5) 统一依赖本包：
 - caller 注入（env A207_CALLER，fail-closed）→ get_caller / set_caller
 - 权限矩阵 + MX-3 写权 + 各包放行集合 → matrix 模块
 - 确定性执行 → enforce_read / enforce_write / check_permission / knowledge_profile
 - 可写状态路径 → resolve_state_path
 
-调用方（各 MCP 工具）应在函数入口：caller = get_caller(); access = enforce_read("a207-xxx-mcp")
+调用方（各 MCP 工具）应在函数入口：caller = get_caller(); access = enforce_read("CKDNutri-nutrition-mcp")
 取代原先「caller 是 LLM 自己填的参数」的旧模式（P0-1 修复）。
 """
 

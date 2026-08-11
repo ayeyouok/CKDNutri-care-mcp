@@ -82,7 +82,7 @@ def check_permission(caller: str, mcp: str, action: str = "read") -> dict:
     if caller_id not in CALLERS:
         return _perm(False, "-", "read", f"caller={caller_id or '(空)'} 未在权限矩阵登记")
     if mcp_id not in PERMISSION_MATRIX:
-        return _perm(False, "-", "read", f"mcp={mcp_id or '(空)'} 不在 13 个已登记 MCP 内")
+        return _perm(False, "-", "read", f"mcp={mcp_id or '(空)'} 不在 5 个已登记 MCP 内")
 
     access = PERMISSION_MATRIX[mcp_id][caller_id]
     tool = detect_write_tool(action_id)
@@ -142,42 +142,42 @@ def enforce_write(mcp_name: str, tool: str | None = None) -> str:
 def enforce_nutrition_tool(caller: str, tool: str) -> str:
     """M3 工具级授权（OD-010 选项 A）：数据面写仅家长/患儿，数据面读 + 计算面仅临床角色。
 
-    M3 是「计算 + 数据」混合包。矩阵对 M3 仅做 MCP 粒度授权（家长/患儿=RL、临床=READ、
-    orchestrator=R/W），无法表达"同包内某些工具家长能写、某些只能临床角色算"。
+    M3 是「计算 + 数据」混合包。矩阵对 M3 仅做 MCP 粒度授权（家长=R/W、临床=READ、
+    risk=-），无法表达"同包内某些工具家长能写、某些只能临床角色算"。
     故在此做工具级细分（单一事实源在 matrix 模块）：
     - 数据面·写 upsert_food_diary：仅家长/患儿（与 MX-3 WRITE_TOOL_POLICY /
       core._WRITE_ALLOWED_CALLERS 一致，单一事实源）
     - 数据面·读 get_food_diary_summary：家长/患儿/临床角色（临床需读日记做评估）
     - 计算面·临床判读/落库（calc_prnt_targets / assess_intake_vs_target / assess_pew_risk /
-      calc_growth_zscore / record_pew_risk / get_pew_history）：仅 doctor/nutritionist/orchestrator
+      calc_growth_zscore / record_pew_risk / get_pew_history）：仅 doctor（临床角色）
     未登记工具 fail-closed 拒绝。caller 为已校验身份字符串（由调用方经 get_caller() 取得）。
     """
     if caller not in CALLERS:
         raise PermissionDenied(
-            caller, "a207-nutrition-assessment-mcp", tool, "caller 未登记")
+            caller, "CKDNutri-nutrition-mcp", tool, "caller 未登记")
     # 数据面·写：饮食日记写入仅家长/患儿（与 MX-3 写权收口一致，单一事实源）
     if tool == "upsert_food_diary":
         if caller in NUTRITION_ASSESSMENT_WRITE_ALLOWED:
             return "RL"
         raise PermissionDenied(
-            caller, "a207-nutrition-assessment-mcp", tool,
+            caller, "CKDNutri-nutrition-mcp", tool,
             "饮食日记写入仅限家长/患儿")
     # 数据面·读：日记摘要家长/患儿/临床角色可读
     if tool in NUTRITION_ASSESSMENT_DATA_TOOLS:
         if caller in NUTRITION_ASSESSMENT_DATA_ROLES:
             return "RL"
         raise PermissionDenied(
-            caller, "a207-nutrition-assessment-mcp", tool,
+            caller, "CKDNutri-nutrition-mcp", tool,
             "日记摘要仅限家长/患儿/临床角色")
     # 计算面·临床判读/落库：仅临床角色
     if tool in NUTRITION_ASSESSMENT_CLINICAL_TOOLS:
         if caller in NUTRITION_ASSESSMENT_CLINICAL_ROLES:
-            return PERMISSION_MATRIX["a207-nutrition-assessment-mcp"][caller]
+            return PERMISSION_MATRIX["CKDNutri-nutrition-mcp"][caller]
         raise PermissionDenied(
-            caller, "a207-nutrition-assessment-mcp", tool,
-            "计算面工具仅限临床角色(doctor/nutritionist/orchestrator)")
+            caller, "CKDNutri-nutrition-mcp", tool,
+            "计算面工具仅限临床角色(doctor)")
     raise PermissionDenied(
-        caller, "a207-nutrition-assessment-mcp", tool, f"未登记工具: {tool}")
+        caller, "CKDNutri-nutrition-mcp", tool, f"未登记工具: {tool}")
 
 
 def _enforce(mcp_name: str, action: str) -> str:

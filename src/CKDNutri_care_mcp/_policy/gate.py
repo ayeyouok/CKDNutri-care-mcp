@@ -129,8 +129,10 @@ def _perm(allow: bool, access: str, resolved_action: str, reason: str, *,
     }
 
 
-def enforce_read(mcp_name: str) -> str:
-    """入口守卫：caller 是否可读 mcp_name。放行返回 access（R/RL/RW），拒绝抛 PermissionDenied。"""
+def enforce_read(mcp_name: str, tool: str | None = None) -> str:
+    """入口守卫：caller 是否可读 mcp_name。放行返回 access（R/RL/RW），拒绝抛 PermissionDenied。
+    tool 参数预留用于未来细粒度读取工具级控制。
+    """
     return _enforce(mcp_name, "read")
 
 

@@ -29,10 +29,36 @@ MCP_REGISTRY: dict[str, str] = {
 CLINICAL_CALC_MCP = "CKDNutri-assessment-mcp"
 
 # 包名别名归一（OD-002）：登记表沿用早期命名，实际交付目录/PyPI 包名已变更。
+# 任何曾经出现过的 a207-* 废弃包名都在此全量归一，避免上游（旧版路由/编排/调用方）
+# 传入旧名时 normalize_mcp 原样返回 → 上层校验 PERMISSION_MATRIX 误报「mcp 未登记」。
+# 注意：a207-router-mcp / a207-gateway-mcp 是网关/中间件、不是数据域 MCP，
+#       故意不在此表 → 它们正确落回「未登记」。
 MCP_ALIASES: dict[str, str] = {
-    "a207-clinical-calc-mcp": "CKDNutri-assessment-mcp",
-    "a207-notification-mcp": "CKDNutri-care-mcp",
+    # --- P1 临床数据（HIS + LIS 合并）---
+    "a207-clinical-data-mcp": "CKDNutri-clinical-data-mcp",
+    "a207-his-mcp": "CKDNutri-clinical-data-mcp",
+    "a207-lis-mcp": "CKDNutri-clinical-data-mcp",
+    # --- P2 营养域（营养评估 + 食物养分 + 食谱 + 游戏化并入）---
+    "a207-nutrition-mcp": "CKDNutri-nutrition-mcp",
+    "a207-nutrition-assessment-mcp": "CKDNutri-nutrition-mcp",
     "a207-nutrition-assessment-mcp-nfyy": "CKDNutri-nutrition-mcp",
+    "a207-nutrition-calc-mcp": "CKDNutri-nutrition-mcp",
+    "a207-meal-plan-mcp": "CKDNutri-nutrition-mcp",
+    "a207-gamification-mcp": "CKDNutri-nutrition-mcp",   # M11 打卡并入 M3 upsert_food_diary
+    # --- P3 随访沟通（随访 + 通知合并）---
+    "a207-care-mcp": "CKDNutri-care-mcp",
+    "a207-followup-mcp": "CKDNutri-care-mcp",
+    "a207-notification-mcp": "CKDNutri-care-mcp",
+    "a207-notify-mcp": "CKDNutri-care-mcp",
+    # --- P4 决策计算（临床计算 + 风险引擎合并）---
+    "a207-decision-mcp": "CKDNutri-assessment-mcp",
+    "a207-clinical-calc-mcp": "CKDNutri-assessment-mcp",
+    "a207-ckd-clinical-calc-mcp": "CKDNutri-assessment-mcp",
+    "a207-risk-rules-mcp": "CKDNutri-assessment-mcp",
+    # --- P5 内容输出（报告 + 知识库合并）---
+    "a207-content-mcp": "CKDNutri-content-mcp",
+    "a207-report-mcp": "CKDNutri-content-mcp",
+    "a207-knowledge-mcp": "CKDNutri-content-mcp",
 }
 
 
@@ -205,15 +231,18 @@ def resolve_access(access: str, is_write: bool) -> bool:
 
 def _matrix_readers(mcp: str) -> frozenset[str]:
     """从权限矩阵派生：对该 mcp 有读权限（R/RL/RW）的 caller 集合。"""
-    return frozenset(c for c, a in PERMISSION_MATRIX[mcp].items() if a in _READ_OK)
+    real_mcp = normalize_mcp(mcp)
+    return frozenset(c for c, a in PERMISSION_MATRIX[real_mcp].items() if a in _READ_OK)
 
 
 def _matrix_writers(mcp: str) -> frozenset[str]:
     """从权限矩阵派生：对该 mcp 有写权限（R/W）的 caller 集合。
 
     OD-011 收口点：各包本地写白名单的唯一事实源就是矩阵，不允许再手写一份更宽的集合。
+    内部先 normalize_mcp 防御：若传入未归一化的旧包名（如 a207-care-mcp）也安全落回矩阵键。
     """
-    return frozenset(c for c, a in PERMISSION_MATRIX[mcp].items() if a == ACCESS_RW)
+    real_mcp = normalize_mcp(mcp)
+    return frozenset(c for c, a in PERMISSION_MATRIX[real_mcp].items() if a == ACCESS_RW)
 
 
 # ================================================================
@@ -277,6 +306,8 @@ NOTIFY_READ_ROLES: frozenset[str] = _matrix_readers("CKDNutri-care-mcp")    # {d
 
 # v2.3 阶段 0 兼容空值（M11/router 本地代码仍 import 这些符号，M11 退役后清理）
 # 设为空以确保：① import 不报错 ② enforce 逻辑拒绝所有调用（退役行为一致）
-GAMIFICATION_MCP = "a207-gamification-mcp"
+# GAMIFICATION_MCP 现指向 M11 并入后的新家（M3 / P2）；GAMIFICATION_ALLOWED 仍为空集合，
+# 故任何引用它的调用方仍被 fail-closed 拒绝，符号漂移已纠正、无安全回归。
+GAMIFICATION_MCP = "CKDNutri-nutrition-mcp"
 GAMIFICATION_ALLOWED: frozenset[str] = frozenset()
 CHILD_FORBIDDEN_MCPS: frozenset[str] = frozenset()

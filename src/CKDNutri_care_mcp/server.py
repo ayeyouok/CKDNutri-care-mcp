@@ -15,6 +15,7 @@ from a207_policy import CallerError
 
 from .core import (
     ack_notification,
+    add_followup_record,
     build_event_notification,
     escalate_notification,
     get_adherence_score,
@@ -38,7 +39,10 @@ def _invalid(exc: Exception) -> dict[str, Any]:
                 "detail": f"caller={getattr(exc, 'caller', '?')} 无权 {getattr(exc, 'action', 'access')}"
                           f"（{getattr(exc, 'reason', str(exc))}）"}
     # BUG-52（2026-08-12）：内部数据错误归 INTERNAL_ERROR，避免误归 INVALID_INPUT
-    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError)):
+    # BUG-65（2026-08-12）：RuntimeError 补入——_load_store/_notify_load 遇 JSON 损坏时
+    # 抛 RuntimeError 包装（fail-closed 防静默清空），此前 _invalid 未覆盖，损坏会被误归
+    # INVALID_INPUT（400），违背"数据文件损坏=服务端内部错误"的归类初衷。
+    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError, RuntimeError)):
         return {"ok": False, "error": "INTERNAL_ERROR",
                 "detail": f"内部数据错误：{exc}"}
     return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
@@ -80,15 +84,46 @@ def get_followup_records_tool(patient_id: str, guardian_token: Optional[str] = N
 
 
 @mcp.tool
+def add_followup_record_tool(
+    patient_id: str,
+    visit_date: str,
+    visit_type: str,
+    ckd_stage: str,
+    indicators_snapshot: Optional[dict] = None,
+    plan_summary: str = "",
+    doctor_notes: str = "",
+) -> dict[str, Any]:
+    """记录一次实际完成的就诊随访（写，仅 CKD 临床助手；MX-3 收口）。
+
+    BUG-65（2026-08-12）：core.add_followup_record 已实现且权限矩阵已登记
+    （WRITE_TOOL_POLICY 白名单 + 矩阵回查），但此前未暴露为 MCP 工具——外部客户端
+    只能创建随访计划（schedule_followup_tool）却无法写入已完成的随访记录。本工具补齐暴露。
+    indicators_snapshot: 本次就诊检验指标快照（如 {egfr, k_mmol_L, ...}），供后续评估对照。"""
+    try:
+        return add_followup_record(
+            patient_id, visit_date, visit_type, ckd_stage,
+            indicators_snapshot or {}, plan_summary, doctor_notes,
+        )
+    except Exception as exc:
+        return _invalid(exc)
+
+
+@mcp.tool
 def get_adherence_score_tool(
     patient_id: str,
     diet_ratio: float,
     med_ratio: float,
     visit_ratio: float,
+    weights: Optional[list] = None,
 ) -> dict[str, Any]:
-    """计算并落库依从性评分。仅 CKD 临床助手可写。"""
+    """计算并落库依从性评分。仅 CKD 临床助手可写。
+
+    BUG-65（2026-08-12）：补 weights 透传——core.calc_adherence_score 支持自定义权重
+    （diet/medication/visit，默认等权 1/3），此前工具层遗漏该参数，客户端无法自定义权重。
+    MCP 层用 list 承载（tuple 非 JSON 原生类型，FastMCP schema 更友好），透传前转 tuple。"""
     try:
-        return get_adherence_score(patient_id, diet_ratio, med_ratio, visit_ratio)
+        kw = {"weights": tuple(weights)} if weights is not None else {}
+        return get_adherence_score(patient_id, diet_ratio, med_ratio, visit_ratio, **kw)
     except Exception as exc:
         return _invalid(exc)
 

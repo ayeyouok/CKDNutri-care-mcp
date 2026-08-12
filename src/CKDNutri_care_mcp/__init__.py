@@ -19,6 +19,7 @@ from importlib import metadata as _metadata
 
 from .core import (
     ack_notification,
+    add_followup_record,
     build_event_notification,
     calc_adherence_score,
     create_notification,
@@ -48,6 +49,7 @@ __version__ = _pkg_version()
 __all__ = [
     "__version__",
     "get_followup_records",
+    "add_followup_record",
     "get_adherence_score",
     "get_pew_timeline",
     "schedule_followup",

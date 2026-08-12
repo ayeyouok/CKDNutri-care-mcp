@@ -26,7 +26,7 @@ import threading
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from a207_policy import (
     FOLLOWUP_CLINICIAN,
@@ -59,6 +59,13 @@ _NOTIFY_DATA_DIR_ENV = "A207_NOTIFICATION_DATA_DIR"
 # 所有写路径的 load→改→save 序列必须持 _STORE_LOCK（单进程内串行化）。
 _STORE_LOCK = threading.Lock()
 
+# 设计说明（2026-08-12 复核）：通知库按 notification_id 为根**扁平存储**是有意取舍——
+# ack/update/escalate 均按 nid O(1) 直查（高频路径）；get_notifications 按 patient_id
+# 过滤是 O(N) 全表遍历（低频读）。文件 JSON 每次读本就全量加载（无索引可言），
+# 儿科单中心量级下遍历开销可忽略；改按 patient_id 嵌套会破坏 nid 直查结构、
+# 波及 create/ack/update/escalate 四处，纯负收益。若未来量级增长到万级通知，
+# 再评估换 SQLite/按患者分片。
+
 
 def _notify_store_path() -> Path:
     """通知写库路径：A207_NOTIFICATION_DATA_DIR override，否则落到 A207_DATA_DIR。"""
@@ -71,9 +78,23 @@ def _notify_store_path() -> Path:
 def _notify_load() -> dict[str, Any]:
     try:
         with open(_notify_store_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+            data = json.load(f)
+    except FileNotFoundError:
         return {}
+    except json.JSONDecodeError as exc:
+        # BUG-65（2026-08-12）：损坏文件禁止静默返回 {} —— 否则下次 _notify_save 会用
+        # 空字典覆盖整个通知库，历史数据永久丢失。改为抛错，由 server._invalid 归
+        # INTERNAL_ERROR（fail-closed，运维可发现并恢复备份）。
+        raise RuntimeError(
+            f"通知库 {_notify_store_path().name} JSON 损坏，拒绝加载（防止静默清空），"
+            f"请检查磁盘/恢复备份: {exc}") from exc
+    # BUG-67（2026-08-12）：合法 JSON 但非 dict（null/[]/"str"）同样拒绝——json.load
+    # 正常返回非字典，后续 store.get()/setdefault() 抛 AttributeError 掩盖"类型损坏"真相。
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"通知库 {_notify_store_path().name} 数据类型错误：期望 dict，"
+            f"实际为 {type(data).__name__}，拒绝加载（防止静默清空）")
+    return data
 
 
 def _notify_save(store: dict[str, Any]) -> None:
@@ -161,12 +182,16 @@ _CITATION = (
     "PRNT 2025 人体测量 CKD5D 每月 (Pediatr Nephrol 40:69-84)"
 )
 # 基础间隔（天）：儿科共识 Rec17 —— G1-2 每 1-2 次/年(180d)，G3a 每 ≥3-4 次/年(90d)，
-# G3b（eGFR 30-44，进展风险高于 G3a）每 ≥5-6 次/年(60d)，G4 每 ≥3-4 次/年(90d)，
+# G3b（eGFR 30-44，进展风险高于 G3a）每 ≥5-6 次/年(60d)，G4 每 ≥6-12 次/年(60d)，
 # G5 每 >4 次/年(60d)，G5D 每月(30d，PRNT 2025)。
 # BUG-50（2026-08-12）：G3b 从 90d 收窄到 60d——KDIGO 2024 建议 G3b 随访频于 G3a
 # （原实现两档同 90d，eGFR 30-44 的进展风险未体现）。
+# BUG-65（2026-08-12）：G4 从 90d 收窄到 60d——修复"G4 比 G3b 更重却随访更稀"的倒挂。
+# 依据：KDIGO 2024 核心原则"风险越高监测越频"（G4 eGFR 15-29 进展风险高于 G3b 30-44），
+# 且 NICE NG203 Table 2（本函数 citation 同引）G4 最低 2 次/年、G5 4 次/年——
+# 原 G4=90d 与 G3b=60d 相比间隔倒置，会延误 G4 期患儿的进展监测。
 _BASE_INTERVAL_DAYS = {
-    "G1": 180, "G2": 180, "G3a": 90, "G3b": 60, "G4": 90, "G5": 60, "G5D": 30,
+    "G1": 180, "G2": 180, "G3a": 90, "G3b": 60, "G4": 60, "G5": 60, "G5D": 30,
 }
 # 白蛋白尿升级：A2 缩短 30 天，A3 缩短 60 天（下限 14 天）
 _ALBUMINURIA_REDUCTION = {"A1": 0, "A2": 30, "A3": 60}
@@ -191,9 +216,21 @@ def store_path() -> Path:
 def _load_store() -> dict:
     try:
         with open(store_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+            data = json.load(f)
+    except FileNotFoundError:
         return {}
+    except json.JSONDecodeError as exc:
+        # BUG-65（2026-08-12）：同 _notify_load——损坏文件抛错（fail-closed），
+        # 禁止静默返回 {} 后被 _save_store 覆盖成空库。
+        raise RuntimeError(
+            f"随访库 {store_path().name} JSON 损坏，拒绝加载（防止静默清空），"
+            f"请检查磁盘/恢复备份: {exc}") from exc
+    # BUG-67（2026-08-12）：合法 JSON 但非 dict（null/[]/"str"）同样拒绝（同 _notify_load）
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"随访库 {store_path().name} 数据类型错误：期望 dict，"
+            f"实际为 {type(data).__name__}，拒绝加载（防止静默清空）")
+    return data
 
 
 def _save_store(store: dict) -> None:
@@ -245,8 +282,13 @@ def recommend_followup_interval(ckd_stage: str, albuminuria_stage: str = "A1") -
     if ckd_stage not in _BASE_INTERVAL_DAYS:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "ckd_stage 必须是 G1/G2/G3a/G3b/G4/G5/G5D"}
+    # BUG-65（2026-08-12）：albuminuria_stage 显式校验合法值——此前仅 .get(...,0) 静默降级，
+    # 传 "A4" 等非法值会被当作 A1 且不报错，掩盖配置错误（与 ckd_stage 的 fail-fast 同口径）。
+    if albuminuria_stage not in _ALBUMINURIA_REDUCTION:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"albuminuria_stage 必须是 A1/A2/A3，收到：{albuminuria_stage!r}"}
     base = _BASE_INTERVAL_DAYS[ckd_stage]
-    red = _ALBUMINURIA_REDUCTION.get(albuminuria_stage, 0)
+    red = _ALBUMINURIA_REDUCTION[albuminuria_stage]
     interval = max(_MIN_INTERVAL, base - red)
     return {
         "ok": True,
@@ -264,12 +306,13 @@ def recommend_followup_interval(ckd_stage: str, albuminuria_stage: str = "A1") -
 # 2. 随访计划（写，医生/营养师）
 # ---------------------------------------------------------------------------
 def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
-                      visit_type: str, anchor_date: str,
+                      visit_type: str, visit_date: str,
                       plan_summary: str = "", note_to_clinician: str = "") -> dict[str, Any]:
     """创建随访计划（写，MX 收口：仅医生/营养师/编排层）。频率来自 KDIGO 2024 推荐。
 
     :param visit_type: outpatient/phone/online/dialysis/nutrition_counsel
-    :param anchor_date: 计划基准日期 YYYY-MM-DD（通常为本次就诊日）
+    :param visit_date: 计划基准日期 YYYY-MM-DD（通常为本次就诊日；BUG-65 统一命名，
+        与 server 工具层及 add_followup_record 的 visit_date 一致，此前 core 叫 anchor_date）
     :param caller: 缺省取部署注入身份（A207_CALLER），模型不可自证（P0-1）
     :param plan_summary: 随访计划摘要（所有角色可见）
     :param note_to_clinician: 仅供医生/营养的备注（患者/家属不可见）
@@ -288,8 +331,8 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
         "plan_id": _short_id("FP", patient_id),
         "cadence": {
             "interval_days": interval,
-            "anchor_date": anchor_date,
-            "next_due_date": _add_days(anchor_date, interval),
+            "anchor_date": visit_date,
+            "next_due_date": _add_days(visit_date, interval),
             "basis": rec["data"]["basis"],
             "citation": rec["data"]["citation"],
         },
@@ -395,6 +438,11 @@ def calc_adherence_score(diet_ratio: float, med_ratio: float, visit_ratio: float
     """
     if not (0.0 <= diet_ratio <= 1.0 and 0.0 <= med_ratio <= 1.0 and 0.0 <= visit_ratio <= 1.0):
         return {"ok": False, "error": "INVALID_INPUT", "detail": "各比率须在 0-1 之间"}
+    # BUG-65（2026-08-12）：weights 必须恰为 3 元素——此前仅校验和=1，传 (0.5, 0.5) 时
+    # 和=1.0 通过校验但下方 weights[2] 抛 IndexError（未捕获崩溃）。
+    if len(weights) != 3:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"weights 必须包含 3 个元素（diet/medication/visit 权重），收到 {len(weights)} 个"}
     # BUG-43（2026-08-12）：权重必须归一（和=1），否则 composite 可超 100（如全 0.5 → 满分 150）
     if abs(sum(weights) - 1.0) > 1e-6:
         return {"ok": False, "error": "INVALID_INPUT",
@@ -428,7 +476,12 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
     orchestrator / child_companion 角色名，避免误导）。
     """
     caller = get_caller()
-    enforce_write(MCP_NAME, tool="get_adherence_score")
+    # BUG-65（2026-08-12）：统一走 _guard 中枢（与其他写工具同口径）——此前裸调
+    # enforce_write，越权抛 PermissionDenied 依赖 server._invalid 兜底转 FORBIDDEN；
+    # _guard 直接返回 FORBIDDEN 信封，行为一致且不依赖调用方异常捕获路径。
+    denied = _guard(MCP_NAME, "get_adherence_score", write=True)
+    if denied:
+        return denied
     res = calc_adherence_score(diet_ratio, med_ratio, visit_ratio, weights)
     if not res["ok"]:
         return res
@@ -455,6 +508,22 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
 _PEW_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
+def _parse_pew_date(value: Any) -> Optional[datetime]:
+    """解析 PEW 历史日期为 datetime；无效/缺失返回 None（BUG-67，对齐 content 包）。
+
+    上游 M3 契约=ISO 升序，此处防御性解析——"/"、"." 分隔转 "-" 后 fromisoformat；
+    无法解析（"Yesterday"、非零填充 "2023-6-1"）返回 None，由调用方剔除
+    （fail-closed：无法可靠定位时间线的数据点不参与趋势计算）。
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("/", "-").replace(".", "-"))
+    except ValueError:
+        return None
+
+
 def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
                      pew_history: list[dict] | None = None) -> dict[str, Any]:
     """PEW 时间线聚合 facade（ADR-007）。
@@ -472,19 +541,51 @@ def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
     denied = _guard_guardian(caller, patient_id, guardian_token, "get_pew_timeline")
     if denied:
         return denied
+    # BUG-66（2026-08-12）：家长/患儿等非临床、非编排角色拒绝外部传入的 pew_history——
+    # 该参数是 facade 的权威数据注入通道（编排层从 M3.get_pew_history 拉取后传入聚合），
+    # 家长若可自行构造 pew_history（含任意 trend 方向）即可伪造 PEW 恶化/改善趋势误导下游。
+    # doctor/risk_warning/orchestrator 保留注入能力（facade 设计用途）。
+    if pew_history and caller not in _CLINICIAN and caller != "orchestrator":
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": "家长/患儿视角不接受外部传入的 pew_history（防伪造 PEW 趋势）；"
+                          "请通过编排层获取 M3 权威历史。"}
     ph = pew_history or []
     trend = "no_data"
-    if len(ph) >= 2:
-        fo = _PEW_ORDER.get(ph[0].get("level", "low"), 0)
-        lo = _PEW_ORDER.get(ph[-1].get("level", "low"), 0)
+    # BUG-65（2026-08-12）：趋势判定前显式按 date 升序排序 + 过滤非 dict 元素——
+    # 上游 M3 get_pew_history 契约=升序，但若传倒序/乱序，ph[0]/ph[-1] 的"最早/最新"
+    # 假设失效，趋势会完全反转（worsening↔improving）。非 dict/null 元素一并过滤
+    # 避免 p.get() AttributeError（与 content 包 _pew_trend 同口径）。
+    # BUG-65 复查：data["points"]/count 统一返回清洗+排序后的 pts（此前返回原始 ph，
+    # 展示与趋势判定口径不一致——乱序输入下 points 显示乱序、count 含无效元素）。
+    # BUG-67（2026-08-12）：剔除日期无效点 + 按解析后日期排序——纯字符串字典序对
+    # "2024-01-10" vs "2024-1-1" 会排错（'-'< '1'，1月1日被排到1月10日之后），
+    # 趋势判定完全反向。fail-closed：无法定位时间线的数据点不参与趋势（对齐 content 包 ⓫）。
+    # BUG-67 后补（2026-08-12）：level 未知值同样剔除——_PEW_ORDER.get(level, 0) 会把
+    # "unknown"/拼写错误静默映射为 0(low)，high→unknown 被误判"改善"掩盖恶化；与日期
+    # 无效同理，无法可靠判定严重度的点不参与趋势（fail-closed，宁可不判不可误判）。
+    dated = []
+    for p in ph:
+        if not isinstance(p, dict):
+            continue
+        dt = _parse_pew_date(p.get("date"))
+        if dt is None:
+            continue
+        if str(p.get("level", "low")).strip().lower() not in _PEW_ORDER:
+            continue
+        dated.append((dt, p))
+    dated.sort(key=lambda x: x[0])  # BUG-67：按解析后日期升序（points/趋势同口径）
+    pts = [p for _, p in dated]
+    if len(pts) >= 2:
+        fo = _PEW_ORDER[str(pts[0].get("level", "low")).strip().lower()]
+        lo = _PEW_ORDER[str(pts[-1].get("level", "low")).strip().lower()]
         trend = "worsening" if lo > fo else "improving" if lo < fo else "stable"
     return {
         "ok": True,
         "data": {
             "patient_id": patient_id,
             "source": "M3 (a207-nutrition-assessment-mcp-nfyy) — ADR-007 PEW 历史归属 M3",
-            "count": len(ph),
-            "points": ph,
+            "count": len(pts),
+            "points": pts,
             "trend": trend,
             "note": "M4 仅作 facade 聚合，PEW 历史存储由 M3 拥有；此工具接受 M3 get_pew_history 的输出再并入统一随访时间线。",
         },
@@ -545,7 +646,13 @@ def build_event_notification(event_type: str, patient_id: str, payload: dict[str
     if tpl is None:
         return {"ok": False, "error": "INVALID_EVENT", "detail": f"未知事件类型: {event_type}"}
     try:
-        body = tpl["body_tmpl"].format(patient_id=patient_id, **payload)
+        # BUG-65（2026-08-12）：payload 可能含 patient_id 键（编排层常见）——直接
+        # .format(patient_id=patient_id, **payload) 会抛 TypeError: got multiple values
+        # for keyword argument 'patient_id'。先合并为单一 dict，显式 patient_id 覆盖
+        # payload 中的同键（两者同值，覆盖无副作用）。
+        fmt_args = dict(payload)
+        fmt_args["patient_id"] = patient_id
+        body = tpl["body_tmpl"].format(**fmt_args)
     except KeyError as exc:
         return {"ok": False, "error": "INVALID_PAYLOAD",
                 "detail": f"事件 {event_type} 缺少字段: {exc}"}
@@ -579,6 +686,11 @@ def get_notifications(patient_id: str,
     denied = _guard_guardian(caller, patient_id, guardian_token, "get_notifications")
     if denied:
         return denied
+    # BUG-65（2026-08-12）：MCP 客户端显式传 JSON null（Python None）时，Optional 默认值
+    # "all" 不生效——None 会落入下方合法性校验直接 INVALID_ARGUMENT。入口统一规范化，
+    # None/空串等价于不过滤（all），与缺省行为一致。
+    status = status or "all"
+    workflow_status = workflow_status or "all"
     _VALID_STATUS = {"all", "unacked", "acked"}
     _VALID_WORKFLOW = {"all", "unacked", "confirmed", "resolved", "closed"}
     if status not in _VALID_STATUS:
@@ -595,7 +707,9 @@ def get_notifications(patient_id: str,
         and (workflow_status == "all" or r.get("workflow_status", "unacked") == workflow_status)
         and (escalated is None or bool(r.get("escalated", False)) == escalated)
     ]
-    items.sort(key=lambda r: r["created_at"], reverse=True)
+    # BUG-65（2026-08-12）：safe get 排序键——硬取 r["created_at"] 时，旧版本数据（早期
+    # 版本未写入该字段）会抛 KeyError。缺省 "" 排到最前（最旧），避免崩溃。
+    items.sort(key=lambda r: r.get("created_at", ""), reverse=True)
     return {"ok": True, "data": {
         "patient_id": patient_id, "count": len(items), "notifications": items}}
 
@@ -677,6 +791,14 @@ def update_notification_status(notification_id: str, new_status: str,
             return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
         current = rec.get("workflow_status", "unacked")
         if new_status == current:
+            # BUG-65（2026-08-12）：幂等返回前，允许"已 resolved 且携带新备注"时更新备注——
+            # 此前 new_status==current 直接返回，医生补充/修正 resolution_note 会被静默忽略。
+            note = (resolution_note or "").strip()
+            if current == "resolved" and note and rec.get("resolution_note") != note:
+                rec["resolution_note"] = note
+                rec["status_updated_by"] = caller
+                rec["status_updated_at"] = _now_iso()
+                _notify_save(store)
             return {"ok": True, "data": {"notification": rec}}  # 幂等
         allowed_next = _WORKFLOW_TRANSITIONS.get(current, frozenset())
         if new_status not in allowed_next:
@@ -688,7 +810,9 @@ def update_notification_status(notification_id: str, new_status: str,
                     "detail": "resolved 必须携带 resolution_note（需求 §5.2）"}
         rec["workflow_status"] = new_status
         rec["status_updated_by"] = caller
-        rec["status_updated_at"] = datetime.now().isoformat()
+        # BUG-65（2026-08-12）：统一 _now_iso()（秒级）——此前裸调 datetime.now().isoformat()
+        # 带微秒，与 create_notification 的 _now_iso() 格式不一致，字典序排序/字符串比较会错位。
+        rec["status_updated_at"] = _now_iso()
         if new_status == "resolved":
             rec["resolution_note"] = resolution_note.strip()
         _notify_save(store)
@@ -718,7 +842,8 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
                     "detail": "已关闭工单不可再升级"}
         rec["escalated"] = True
         rec["escalated_by"] = caller
-        rec["escalated_at"] = datetime.now().isoformat()
+        # BUG-65（2026-08-12）：统一 _now_iso()（秒级），与 create_notification 等一致
+        rec["escalated_at"] = _now_iso()
         if reason.strip():
             rec["escalation_reason"] = reason.strip()
         _notify_save(store)

@@ -36,15 +36,18 @@ def test_notification_lifecycle():
     )
     assert created.get("ok") is True
     got = core.get_notifications(patient_id="P001")
-    assert got.get("count", 0) >= 1
-    nid = got["notifications"][0]["id"]
+    assert got["data"]["count"] >= 1
+    nid = got["data"]["notifications"][0]["id"]
     assert core.ack_notification(nid).get("ok") is True
+    # 严格一步流转：unacked→confirmed→resolved(需 note)→closed（BUG-09/10 修复后）
     assert core.update_notification_status(nid, "confirmed").get("ok") is True
-    assert core.update_notification_status(nid, "resolved").get("ok") is True
+    assert core.update_notification_status(nid, "resolved", "已处理").get("ok") is True
     assert core.update_notification_status(nid, "closed").get("ok") is True
-    # 逆向流转必须被拒
+    # 终态 closed 后不可回退/跳转（INVALID_TRANSITION）；acked 非 workflow 态（INVALID_STATUS）
+    skip = core.update_notification_status(nid, "resolved")
+    assert skip.get("ok") is False and skip.get("error") == "INVALID_TRANSITION"
     reopen = core.update_notification_status(nid, "acked")
-    assert reopen.get("ok") is False and reopen.get("error") == "INVALID_TRANSITION"
+    assert reopen.get("ok") is False and reopen.get("error") == "INVALID_STATUS"
 
 
 if __name__ == "__main__":

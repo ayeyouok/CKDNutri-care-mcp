@@ -29,9 +29,7 @@ from typing import Any
 
 from a207_policy import (
     FOLLOWUP_CLINICIAN,
-    FOLLOWUP_WRITE_ALLOWED,
-    NOTIFY_READ_ROLES,
-    NOTIFY_WRITE_ROLES,
+    PermissionDenied,
     atomic_write_json,
     enforce_read,
     enforce_write,
@@ -44,20 +42,13 @@ DATA_DIR_ENV = "A207_FOLLOWUP_DATA_DIR"
 # 本包在权限矩阵中的登记名（enforce_* 查表键，唯一事实源在 a207_policy.matrix）
 MCP_NAME = "CKDNutri-care-mcp"
 
-# 放行集合唯一事实源在 a207_policy.matrix（P1-1）；此处仅保留本地别名，下文逻辑零改动。
-# 写权限（schedule_followup 收口）：仅医生/营养师/编排层
-_WRITE_ALLOWED = FOLLOWUP_WRITE_ALLOWED
-# 临床角色可见原始医生备注；患者/家属角色仅可见摘要
+# 临床角色可见原始医生备注；患者/家属角色仅可见摘要（角色集合单一事实源在 a207_policy）
 _CLINICIAN = FOLLOWUP_CLINICIAN
 
 # ---------------------------------------------------------------------------
 # M10 通知引擎支持块（与随访存储隔离，避免 key 命名空间污染）
+# 权限判定统一走 _guard → enforce_*（2026-08-12 双轨制清理，见 _guard 定义）
 # ---------------------------------------------------------------------------
-# 通知写权限：仅临床助手/风险管线（NOTIFY_WRITE_ROLES = {doctor, risk}）
-_WRITE_ROLES = NOTIFY_WRITE_ROLES
-# 通知读权限：临床/家庭/风险均可读自己患者的通知
-_READ_ROLES = NOTIFY_READ_ROLES
-
 _NOTIFY_STORE_FILENAME = "notification_store.json"
 _NOTIFY_DATA_DIR_ENV = "A207_NOTIFICATION_DATA_DIR"
 
@@ -86,6 +77,22 @@ def _notify_save(store: dict[str, Any]) -> None:
 def _forbidden(role: str, action: str) -> dict[str, Any]:
     return {"ok": False, "error": "FORBIDDEN",
             "detail": f"caller={role} 无权执行 {action}（P3 权限矩阵）"}
+
+
+def _guard(mcp_name: str, tool: str, *, write: bool = False) -> dict[str, Any] | None:
+    """统一权限守卫（2026-08-12 双轨制清理）：所有工具统一走 a207_policy.enforce_* 中枢，
+    MX-3 写工具白名单与矩阵回查在此生效；越权转成既有 FORBIDDEN 信封（契约不变）。
+    此前 schedule_followup / create_notification / ack_notification 用本地集合手动判断，
+    绕过 enforce_* 的 MX-3 与矩阵回查——策略收紧时本地集合不会同步生效。
+    """
+    try:
+        if write:
+            enforce_write(mcp_name, tool)
+        else:
+            enforce_read(mcp_name, tool)
+    except PermissionDenied as exc:
+        return _forbidden(exc.caller, exc.reason)
+    return None
 
 
 # 末端事件 -> 通知模板（零跨包 import：事件数据由编排层经 payload 传入）
@@ -212,11 +219,13 @@ def recommend_followup_interval(ckd_stage: str, albuminuria_stage: str = "A1") -
     interval = max(_MIN_INTERVAL, base - red)
     return {
         "ok": True,
-        "ckd_stage": ckd_stage,
-        "albuminuria_stage": albuminuria_stage,
-        "recommended_interval_days": interval,
-        "basis": "KDIGO 2024 儿科随访频率（NICE NG203 Table 2 + 儿科共识 Rec17 + PRNT 2025）",
-        "citation": _CITATION,
+        "data": {
+            "ckd_stage": ckd_stage,
+            "albuminuria_stage": albuminuria_stage,
+            "recommended_interval_days": interval,
+            "basis": "KDIGO 2024 儿科随访频率（NICE NG203 Table 2 + 儿科共识 Rec17 + PRNT 2025）",
+            "citation": _CITATION,
+        },
     }
 
 
@@ -235,21 +244,23 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
     :param note_to_clinician: 仅供医生/营养的备注（患者/家属不可见）
     """
     caller = get_caller()
-    if caller not in _WRITE_ALLOWED:
-        return {"ok": False, "error": "FORBIDDEN",
-                "detail": "随访计划仅医生/营养师/编排层可创建（MX 写权收口）"}
+    # 双轨制清理（2026-08-12）：统一走 enforce_write 中枢（MX-3 + 矩阵回查），
+    # 不再本地判断 _WRITE_ALLOWED（策略收紧时本地集合不会同步生效）。
+    denied = _guard(MCP_NAME, "schedule_followup", write=True)
+    if denied:
+        return denied
     rec = recommend_followup_interval(ckd_stage, albuminuria_stage)
     if not rec["ok"]:
         return rec
-    interval = rec["recommended_interval_days"]
+    interval = rec["data"]["recommended_interval_days"]
     plan = {
         "plan_id": _short_id("FP", patient_id),
         "cadence": {
             "interval_days": interval,
             "anchor_date": anchor_date,
             "next_due_date": _add_days(anchor_date, interval),
-            "basis": rec["basis"],
-            "citation": rec["citation"],
+            "basis": rec["data"]["basis"],
+            "citation": rec["data"]["citation"],
         },
         "visit_type": visit_type,
         "status": "active",
@@ -263,7 +274,7 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
     p["plans"].append(plan)
     _save_store(store)
     # 写操作由临床角色发起，返回完整计划
-    return {"ok": True, "plan": plan}
+    return {"ok": True, "data": {"plan": plan}}
 
 
 # ---------------------------------------------------------------------------
@@ -277,20 +288,26 @@ def get_followup_records(patient_id: str) -> dict[str, Any]:
     身份缺省取部署注入值（A207_CALLER），模型不可自证（P0-1）。
     """
     caller = get_caller()
-    enforce_read(MCP_NAME)
+    # 双轨制清理：统一走 enforce_read 中枢
+    denied = _guard(MCP_NAME, "get_followup_records", write=False)
+    if denied:
+        return denied
     store = _load_store()
     p = store.get(patient_id)
     if not p:
-        return {"ok": True, "patient_id": patient_id, "records": [], "plans": [],
-                "message": "无随访数据", "visibility": "summary_only"}
+        return {"ok": True, "data": {
+            "patient_id": patient_id, "records": [], "plans": [],
+            "message": "无随访数据", "visibility": "summary_only"}}
     records = [_visible_record(r, caller) for r in p["records"]]
     plans = [_visible_plan(pl, caller) for pl in p["plans"]]
     return {
         "ok": True,
-        "patient_id": patient_id,
-        "records": records,
-        "plans": plans,
-        "visibility": "full" if caller in _CLINICIAN else "summary_only",
+        "data": {
+            "patient_id": patient_id,
+            "records": records,
+            "plans": plans,
+            "visibility": "full" if caller in _CLINICIAN else "summary_only",
+        },
     }
 
 
@@ -298,10 +315,10 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
                         indicators_snapshot: dict, plan_summary: str, doctor_notes: str = "") -> dict[str, Any]:
     """追加一条随访记录（内部助手，供编排层/医生写入；不在 MCP 工具直接暴露，由 router 调 server 封装）。"""
     caller = get_caller()
-    # OD-014：写路径统一走矩阵收口（与 schedule_followup 一致：仅医生/营养师/编排层）
-    if caller not in _WRITE_ALLOWED:
-        return {"ok": False, "error": "FORBIDDEN",
-                "detail": "随访记录仅医生/营养师/编排层可写入（MX 写权收口）"}
+    # 双轨制清理：统一走 enforce_write 中枢（MX-3 写工具白名单，与 schedule_followup 一致）
+    denied = _guard(MCP_NAME, "add_followup_record", write=True)
+    if denied:
+        return denied
     rec = {
         "record_id": _short_id("FR", patient_id),
         "visit_date": visit_date,
@@ -317,7 +334,8 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
     p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
     p["records"].append(rec)
     _save_store(store)
-    return {"ok": True, "record": rec}
+    # BUG-32（2026-08-12）：返回统一 {ok, data} 信封（与其他写操作一致）
+    return {"ok": True, "data": {"record": rec}}
 
 
 # ---------------------------------------------------------------------------
@@ -343,15 +361,17 @@ def calc_adherence_score(diet_ratio: float, med_ratio: float, visit_ratio: float
     level = "good" if composite >= 80 else "fair" if composite >= 50 else "poor"
     return {
         "ok": True,
-        "composite_score": round(composite, 1),
-        "level": level,
-        "components": {
-            "diet": round(diet_ratio * 100, 1),
-            "medication": round(med_ratio * 100, 1),
-            "visit": round(visit_ratio * 100, 1),
+        "data": {
+            "composite_score": round(composite, 1),
+            "level": level,
+            "components": {
+                "diet": round(diet_ratio * 100, 1),
+                "medication": round(med_ratio * 100, 1),
+                "visit": round(visit_ratio * 100, 1),
+            },
+            "weights": {"diet": weights[0], "medication": weights[1], "visit": weights[2]},
+            "basis": "系统定义加权复合分（参考 MMAS-8 测量范式；儿科 CKD 复合评分无单一验证量表，待临床验证）",
         },
-        "weights": {"diet": weights[0], "medication": weights[1], "visit": weights[2]},
-        "basis": "系统定义加权复合分（参考 MMAS-8 测量范式；儿科 CKD 复合评分无单一验证量表，待临床验证）",
     }
 
 
@@ -361,9 +381,9 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
     """计算并记录某患者依从性评分（M4 拥有依从性数据，落库快照）。
 
     身份缺省取部署注入值（A207_CALLER），模型不可自证（P0-1）。
-    OD-014：本工具会落库（写操作），入口经 MX-3 收口——仅 doctor_assistant /
-    nutritionist / orchestrator 可写；parent_assistant / child_companion 矩阵 M4=RL 只读，
-    越权抛 PermissionDenied（此前漏校验，实测可越权写入依从性历史，污染后续报告）。
+    OD-014：本工具会落库（写操作），入口经 MX-3 收口——WRITE_TOOL_POLICY 登记
+    allowed={doctor_assistant}（2026-08-12 清理：注释移除已退役的 nutritionist /
+    orchestrator / child_companion 角色名，避免误导）。
     """
     caller = get_caller()
     enforce_write(MCP_NAME, tool="get_adherence_score")
@@ -372,17 +392,17 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
         return res
     snap = {
         "date": _today(),
-        "composite_score": res["composite_score"],
-        "level": res["level"],
-        "components": res["components"],
+        "composite_score": res["data"]["composite_score"],
+        "level": res["data"]["level"],
+        "components": res["data"]["components"],
         "recorded_by": caller,
     }
     store = _load_store()
     p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
     p["adherence"].append(snap)
     _save_store(store)
-    res["patient_id"] = patient_id
-    res["history"] = p["adherence"]
+    res["data"]["patient_id"] = patient_id
+    res["data"]["history"] = p["adherence"]
     return res
 
 
@@ -401,7 +421,9 @@ def get_pew_timeline(patient_id: str, pew_history: list[dict] | None = None) -> 
     P1-2：本工具原名 get_pew_history，与 M3 同名接口易混淆双跳，已更名为 get_pew_timeline。
     """
     caller = get_caller()
-    enforce_read(MCP_NAME)
+    denied = _guard(MCP_NAME, "get_pew_timeline", write=False)
+    if denied:
+        return denied
     ph = pew_history or []
     trend = "no_data"
     if len(ph) >= 2:
@@ -410,12 +432,14 @@ def get_pew_timeline(patient_id: str, pew_history: list[dict] | None = None) -> 
         trend = "worsening" if lo > fo else "improving" if lo < fo else "stable"
     return {
         "ok": True,
-        "patient_id": patient_id,
-        "source": "M3 (a207-nutrition-assessment-mcp-nfyy) — ADR-007 PEW 历史归属 M3",
-        "count": len(ph),
-        "points": ph,
-        "trend": trend,
-        "note": "M4 仅作 facade 聚合，PEW 历史存储由 M3 拥有；此工具接受 M3 get_pew_history 的输出再并入统一随访时间线。",
+        "data": {
+            "patient_id": patient_id,
+            "source": "M3 (a207-nutrition-assessment-mcp-nfyy) — ADR-007 PEW 历史归属 M3",
+            "count": len(ph),
+            "points": ph,
+            "trend": trend,
+            "note": "M4 仅作 facade 聚合，PEW 历史存储由 M3 拥有；此工具接受 M3 get_pew_history 的输出再并入统一随访时间线。",
+        },
     }
 
 
@@ -425,10 +449,14 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     """直接创建一条通知（写，仅编排/临床角色）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
+    BUG-11 修复：补齐闭环字段 workflow_status / status_updated_by / status_updated_at
+    （需求 §5.2：家长视角 get_notifications 需看到 workflow_status 字段）。
     """
     caller = get_caller()
-    if caller not in _WRITE_ROLES:
-        return _forbidden(caller, "create_notification")
+    # 双轨制清理：统一走 enforce_write 中枢（MX-3：create_notification 已登记，doctor/risk）
+    denied = _guard(MCP_NAME, "create_notification", write=True)
+    if denied:
+        return denied
     store = _notify_load()
     nid = "N" + uuid.uuid4().hex[:12].upper()
     rec = {
@@ -441,11 +469,16 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
         "created_at": _now_iso(),
         "due_at": due_at,
         "source_event": source_event,
+        # 已读状态（ack_notification 置 acked，幂等）
         "status": "unacked",
+        # 闭环工作流状态（update_notification_status 严格一步推进，BUG-10/11/12）
+        "workflow_status": "unacked",
+        "status_updated_by": None,
+        "status_updated_at": None,
     }
     store[nid] = rec
     _notify_save(store)
-    return {"ok": True, "notification": rec}
+    return {"ok": True, "data": {"notification": rec}}
 
 
 def build_event_notification(event_type: str, patient_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -472,68 +505,123 @@ def build_event_notification(event_type: str, patient_id: str, payload: dict[str
 
 
 def get_notifications(patient_id: str,
-                      status: str = "all") -> dict[str, Any]:
-    """读取某患者的通知列表（读，所有角色可读自己患者的通知）。status=all/unacked/acked。
+                      status: str = "all",
+                      workflow_status: str = "all") -> dict[str, Any]:
+    """读取某患者的通知列表（读，所有角色可读自己患者的通知）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
+    - status: 已读状态过滤 all/unacked/acked（ack_notification 置 acked）
+    - workflow_status: 闭环状态过滤 all/unacked/confirmed/resolved/closed/escalated（BUG-25 修复，
+      需求 §5.2 家长视角需见 workflow_status 字段；医生可按"未关闭工单"快速过滤）
+    BUG-37（2026-08-12）：status / workflow_status 参数校验合法值，非法值返回 INVALID_ARGUMENT
+    （此前静默返回空列表，typo 难排查）。
+    返回条目含 workflow_status / status_updated_by / status_updated_at 闭环字段。
     """
     caller = get_caller()
-    if caller not in _READ_ROLES:
-        return _forbidden(caller, "get_notifications")
+    denied = _guard(MCP_NAME, "get_notifications", write=False)
+    if denied:
+        return denied
+    _VALID_STATUS = {"all", "unacked", "acked"}
+    _VALID_WORKFLOW = {"all", "unacked", "confirmed", "resolved", "closed", "escalated"}
+    if status not in _VALID_STATUS:
+        return {"ok": False, "error": "INVALID_ARGUMENT",
+                "detail": f"status 必须是 {sorted(_VALID_STATUS)} 之一，收到：{status!r}"}
+    if workflow_status not in _VALID_WORKFLOW:
+        return {"ok": False, "error": "INVALID_ARGUMENT",
+                "detail": f"workflow_status 必须是 {sorted(_VALID_WORKFLOW)} 之一，收到：{workflow_status!r}"}
     store = _notify_load()
-    items = [r for r in store.values()
-             if r["patient_id"] == patient_id and (status == "all" or r["status"] == status)]
+    items = [
+        r for r in store.values()
+        if r["patient_id"] == patient_id
+        and (status == "all" or r["status"] == status)
+        and (workflow_status == "all" or r.get("workflow_status", "unacked") == workflow_status)
+    ]
     items.sort(key=lambda r: r["created_at"], reverse=True)
-    return {"ok": True, "patient_id": patient_id, "count": len(items), "notifications": items}
+    return {"ok": True, "data": {
+        "patient_id": patient_id, "count": len(items), "notifications": items}}
 
 
 def ack_notification(notification_id: str) -> dict[str, Any]:
-    """确认/已读一条通知（读角色均可）。幂等。
+    """确认通知已读（幂等）。仅置 status=acked，**不改变** workflow_status（BUG-12）。
 
+    需求 §5.2：已读确认与闭环工作流状态分离——ack 是"家长/医生已读"，闭环流转由
+    update_notification_status 推进（unacked→confirmed→resolved→closed）。
+
+    BUG-28 说明（2026-08-12）：ack 走**读权闸门（write=False）是有意的设计意图**——
+    所有拥有 P3 读权的角色（含家长）都可标记自己患者的通知已读；它不登记
+    WRITE_TOOL_POLICY（ack 不产生新的业务状态、幂等、无 MX-3 收口需求）。
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
     caller = get_caller()
-    if caller not in _READ_ROLES:
-        return _forbidden(caller, "ack_notification")
+    denied = _guard(MCP_NAME, "ack_notification", write=False)
+    if denied:
+        return denied
     store = _notify_load()
     rec = store.get(notification_id)
     if rec is None:
         return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {notification_id} 不存在"}
     rec["status"] = "acked"
     _notify_save(store)
-    return {"ok": True, "notification": rec}
+    return {"ok": True, "data": {"notification": rec}}
 
 # ================================================================
-# 闭环状态机: update_notification_status (v2.3)
+# 闭环状态机: update_notification_status (v2.3 / 2026-08-12 重构)
 # ================================================================
+
+# 需求 §5.1：unacked → confirmed → resolved → closed（严格一步流转，禁止跳级）。
+# escalated 为 HAIP Workflow 旁路：24h 未确认自动升级，升级后由临床收尾（resolved/closed）。
+_WORKFLOW_ORDER = ["unacked", "confirmed", "resolved", "closed"]
+_WORKFLOW_ALLOWED = frozenset({"unacked", "confirmed", "resolved", "closed", "escalated"})
+_WORKFLOW_TRANSITIONS: dict[str, frozenset[str]] = {
+    "unacked": frozenset({"confirmed", "escalated"}),   # confirmed=医生确认；escalated=HAIP 自动升级
+    # BUG-24 修复（2026-08-12）：confirmed 也允许 escalated —— 医生已确认后病情若再恶化，
+    # HAIP 仍需可升级该通知（需求 §5.2「24h 未确认自动升级」覆盖不了"已确认后恶化"场景）。
+    "confirmed": frozenset({"resolved", "escalated"}),
+    "escalated": frozenset({"resolved", "closed"}),
+    "resolved": frozenset({"closed"}),
+    "closed": frozenset(),                              # 终态
+}
+
 
 def update_notification_status(notification_id: str, new_status: str,
                                 resolution_note: str = "") -> dict[str, Any]:
-    """推移风险闭环状态机。仅 CKD 临床助手。
+    """推移风险闭环状态机。仅 CKD 临床助手（MX-3 收口，BUG-04 修复）。
 
-    状态正向流转（与 ack/通知共用同一 status 字段）：
-    unacked → acked → confirmed → resolved → closed。
-    acked 由 ack_notification 设置；confirm/resolve/close 由本工具推进。
+    需求 §5.1/§5.2：
+    - workflow_status 严格一步流转：unacked → confirmed → resolved → closed；
+      escalated 为 HAIP 自动升级旁路（24h 未确认），升级后可 resolved/closed 收尾。
+    - resolved 必须携带 resolution_note（BUG-09 修复，缺则返回 INVALID_ARGUMENT）。
+    - 与 ack_notification 解耦：ack 只置已读 status，本工具只推进 workflow_status（BUG-12）。
     """
     caller = get_caller()
-    enforce_write('CKDNutri-care-mcp', tool='update_notification_status')
-    ALLOWED = {"unacked", "acked", "confirmed", "resolved", "closed"}
-    if new_status not in ALLOWED:
-        return {"ok": False, "error": "INVALID_STATUS", "detail": f"status must be one of {ALLOWED}"}
+    # BUG-04 修复：update_notification_status 已登记 WRITE_TOOL_POLICY（allowed={doctor}），
+    # enforce_write 走工具白名单 + 矩阵回查，risk_warning 管线身份不再可推移人工闭环。
+    denied = _guard(MCP_NAME, "update_notification_status", write=True)
+    if denied:
+        return denied
+    if new_status not in _WORKFLOW_ALLOWED:
+        return {"ok": False, "error": "INVALID_STATUS",
+                "detail": f"status 必须是 {sorted(_WORKFLOW_ALLOWED)} 之一"}
     store = _notify_load()
     nid = notification_id.strip()
     rec = store.get(nid)
     if rec is None:
         return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
-    current = rec.get("status", "unacked")
-    ORDER = ["unacked", "acked", "confirmed", "resolved", "closed"]
-    if new_status != current and ORDER.index(new_status) <= ORDER.index(current):
+    current = rec.get("workflow_status", "unacked")
+    if new_status == current:
+        return {"ok": True, "data": {"notification": rec}}  # 幂等
+    allowed_next = _WORKFLOW_TRANSITIONS.get(current, frozenset())
+    if new_status not in allowed_next:
         return {"ok": False, "error": "INVALID_TRANSITION",
-                "detail": f"Cannot go from {current} to {new_status}"}
-    rec["status"] = new_status
+                "detail": f"workflow_status 不允许从 {current} 直接转到 {new_status}"
+                          f"（严格一步流转，需求 §5.1）"}
+    if new_status == "resolved" and not (resolution_note or "").strip():
+        return {"ok": False, "error": "INVALID_ARGUMENT",
+                "detail": "resolved 必须携带 resolution_note（需求 §5.2）"}
+    rec["workflow_status"] = new_status
     rec["status_updated_by"] = caller
     rec["status_updated_at"] = datetime.now().isoformat()
-    if new_status == "resolved" and resolution_note:
-        rec["resolution_note"] = resolution_note
+    if new_status == "resolved":
+        rec["resolution_note"] = resolution_note.strip()
     _notify_save(store)
-    return {"ok": True, "notification": rec}
+    return {"ok": True, "data": {"notification": rec}}

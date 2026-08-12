@@ -14,7 +14,6 @@ from a207_policy import CallerError
 from .core import (
     ack_notification,
     build_event_notification,
-    create_notification,
     get_adherence_score,
     get_followup_records,
     get_notifications,
@@ -99,10 +98,12 @@ def get_pew_timeline_tool(
 def get_notifications_tool(
     patient_id: str,
     status: Optional[str] = "all",
+    workflow_status: Optional[str] = "all",
 ) -> dict[str, Any]:
-    """查通知列表（可按 status/ack 过滤，含 workflow_status 闭环字段）。"""
+    """查通知列表。status 按已读（all/unacked/acked）；workflow_status 按闭环状态
+    （all/unacked/confirmed/resolved/closed/escalated，BUG-25 新增）。"""
     try:
-        return get_notifications(patient_id, status=status)
+        return get_notifications(patient_id, status=status, workflow_status=workflow_status)
     except Exception as exc:
         return _invalid(exc)
 
@@ -148,11 +149,12 @@ def update_notification_status_tool(
     new_status: str,
     resolution_note: str = "",
 ) -> dict[str, Any]:
-    """推移风险闭环状态机。仅 CKD 临床助手。
+    """推移风险闭环状态机。仅 CKD 临床助手（MX-3 收口）。
 
-    workflow_status: unacked → confirmed → resolved → closed
-    须在 confirmed 后才能设为 resolved（需 resolution_note）；
-    24h 内未确认的由 HAIP Workflow 自动升级（escalated）。
+    workflow_status: unacked → confirmed → resolved → closed（严格一步流转，禁止跳级）；
+    escalated 为 HAIP 自动升级旁路（24h 未确认），升级后可 resolved/closed 收尾。
+    resolved 必须携带 resolution_note（需求 §5.2）。
+    已读确认请用 ack_notification_tool（只置 status=acked，不影响 workflow_status）。
     """
     try:
         return update_notification_status(notification_id, new_status, resolution_note)

@@ -5,6 +5,8 @@ v2.3 新增：trigger_event_notification（DAG）+ update_notification_status（
 """
 from __future__ import annotations
 
+import json
+
 from typing import Any, Optional
 
 from fastmcp import FastMCP
@@ -14,6 +16,7 @@ from a207_policy import CallerError
 from .core import (
     ack_notification,
     build_event_notification,
+    escalate_notification,
     get_adherence_score,
     get_followup_records,
     get_notifications,
@@ -27,7 +30,17 @@ mcp = FastMCP("CKDNutri-care-mcp")
 
 def _invalid(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, CallerError):
-        raise
+        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封（与本包 _guard /
+        # clinical-data _guard_access 同格式），不再向上抛导致 500；PermissionDenied 带
+        # caller/action/reason，CallerUnknown 缺字段时降级文案。此前 get_adherence_score 等
+        # 裸调 enforce_* 的工具有越权即 500 崩溃。
+        return {"ok": False, "error": "FORBIDDEN",
+                "detail": f"caller={getattr(exc, 'caller', '?')} 无权 {getattr(exc, 'action', 'access')}"
+                          f"（{getattr(exc, 'reason', str(exc))}）"}
+    # BUG-52（2026-08-12）：内部数据错误归 INTERNAL_ERROR，避免误归 INVALID_INPUT
+    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError)):
+        return {"ok": False, "error": "INTERNAL_ERROR",
+                "detail": f"内部数据错误：{exc}"}
     return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
 
@@ -58,10 +71,10 @@ def schedule_followup_tool(
 
 
 @mcp.tool
-def get_followup_records_tool(patient_id: str) -> dict[str, Any]:
-    """查随访历史（含计划 + 下次到期日）。按身份视图裁剪。"""
+def get_followup_records_tool(patient_id: str, guardian_token: Optional[str] = None) -> dict[str, Any]:
+    """查随访历史（含计划 + 下次到期日）。按身份视图裁剪；家长需携带 guardian_token。"""
     try:
-        return get_followup_records(patient_id)
+        return get_followup_records(patient_id, guardian_token=guardian_token)
     except Exception as exc:
         return _invalid(exc)
 
@@ -83,11 +96,12 @@ def get_adherence_score_tool(
 @mcp.tool
 def get_pew_timeline_tool(
     patient_id: str,
+    guardian_token: Optional[str] = None,
     pew_history: Optional[list] = None,
 ) -> dict[str, Any]:
-    """PEW 历史并入统一随访时间线（facade）。"""
+    """PEW 历史并入统一随访时间线（facade）。家长需携带 guardian_token。"""
     try:
-        return get_pew_timeline(patient_id, pew_history=pew_history)
+        return get_pew_timeline(patient_id, guardian_token=guardian_token, pew_history=pew_history)
     except Exception as exc:
         return _invalid(exc)
 
@@ -99,20 +113,24 @@ def get_notifications_tool(
     patient_id: str,
     status: Optional[str] = "all",
     workflow_status: Optional[str] = "all",
+    escalated: Optional[bool] = None,
+    guardian_token: Optional[str] = None,
 ) -> dict[str, Any]:
     """查通知列表。status 按已读（all/unacked/acked）；workflow_status 按闭环状态
-    （all/unacked/confirmed/resolved/closed/escalated，BUG-25 新增）。"""
+    （all/unacked/confirmed/resolved/closed，BUG-25 新增）；escalated 按升级布尔过滤
+    （BUG-46：escalated 独立于 workflow_status）。家长需携带 guardian_token。"""
     try:
-        return get_notifications(patient_id, status=status, workflow_status=workflow_status)
+        return get_notifications(patient_id, status=status, workflow_status=workflow_status,
+                                 escalated=escalated, guardian_token=guardian_token)
     except Exception as exc:
         return _invalid(exc)
 
 
 @mcp.tool
-def ack_notification_tool(notification_id: str) -> dict[str, Any]:
-    """确认通知（幂等）。"""
+def ack_notification_tool(notification_id: str, guardian_token: Optional[str] = None) -> dict[str, Any]:
+    """确认通知（幂等）。家长需携带 guardian_token 且与通知所属患者绑定。"""
     try:
-        return ack_notification(notification_id)
+        return ack_notification(notification_id, guardian_token=guardian_token)
     except Exception as exc:
         return _invalid(exc)
 
@@ -152,12 +170,24 @@ def update_notification_status_tool(
     """推移风险闭环状态机。仅 CKD 临床助手（MX-3 收口）。
 
     workflow_status: unacked → confirmed → resolved → closed（严格一步流转，禁止跳级）；
-    escalated 为 HAIP 自动升级旁路（24h 未确认），升级后可 resolved/closed 收尾。
     resolved 必须携带 resolution_note（需求 §5.2）。
+    BUG-46：升级是**独立布尔**（escalate_notification_tool 设置 escalated），与
+    workflow_status 正交——通知可在 unacked/confirmed 下被升级，不丢失升级前状态。
     已读确认请用 ack_notification_tool（只置 status=acked，不影响 workflow_status）。
     """
     try:
         return update_notification_status(notification_id, new_status, resolution_note)
+    except Exception as exc:
+        return _invalid(exc)
+
+@mcp.tool
+def escalate_notification_tool(notification_id: str, reason: str = "") -> dict[str, Any]:
+    """标记通知升级（HAIP 24h 未确认自动升级 / 临床主动升级）。仅 CKD 临床助手。
+
+    escalated 是独立布尔字段（BUG-46）：升级后 workflow_status 保持原值
+    （unacked/confirmed 皆可被升级），不丢失"升级前是否已确认"信息。"""
+    try:
+        return escalate_notification(notification_id, reason)
     except Exception as exc:
         return _invalid(exc)
 

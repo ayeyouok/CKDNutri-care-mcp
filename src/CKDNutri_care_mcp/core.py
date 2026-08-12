@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -35,6 +36,7 @@ from a207_policy import (
     enforce_write,
     get_caller,
     resolve_state_path,
+    verify_guardian_token,
 )
 
 STORE_FILENAME = "followup_store.json"
@@ -51,6 +53,11 @@ _CLINICIAN = FOLLOWUP_CLINICIAN
 # ---------------------------------------------------------------------------
 _NOTIFY_STORE_FILENAME = "notification_store.json"
 _NOTIFY_DATA_DIR_ENV = "A207_NOTIFICATION_DATA_DIR"
+
+# BUG-53（2026-08-12）：通知/随访存储的 read-modify-write 并发保护——
+# atomic_write_json 只防单次写半截断，不防两请求读-改-写丢更新；
+# 所有写路径的 load→改→save 序列必须持 _STORE_LOCK（单进程内串行化）。
+_STORE_LOCK = threading.Lock()
 
 
 def _notify_store_path() -> Path:
@@ -95,6 +102,27 @@ def _guard(mcp_name: str, tool: str, *, write: bool = False) -> dict[str, Any] |
     return None
 
 
+def _guard_guardian(caller: str, patient_id: str, guardian_token: str | None,
+                    tool: str) -> dict[str, Any] | None:
+    """家长-患儿绑定核验（BUG-40 修复，2026-08-12）。
+
+    P3 面向家长的读工具此前只做矩阵级 enforce_read（家长对 P3=READ/RL 放行），
+    家长可传任意 patient_id 读取其他患儿随访摘要/通知/PEW 趋势/标记已读——跨患者
+    隐私泄露。本辅助与 P1/P2 同口径：复用 a207_policy.verify_guardian_token
+    （含过期校验，单一事实源，不在此维护副本）；家长必须携带与其患儿绑定的
+    guardian_token 才能访问。
+    """
+    if caller != "parent_assistant":
+        return None
+    if not guardian_token:
+        return {"ok": False, "error": "GUARDIAN_UNVERIFIED",
+                "detail": f"caller=parent_assistant 调用 {tool} 必须携带 guardian_token"}
+    if not verify_guardian_token(patient_id, guardian_token):
+        return {"ok": False, "error": "FORBIDDEN",
+                "detail": f"guardian_token 与 patient_id={patient_id} 不匹配或已过期"}
+    return None
+
+
 # 末端事件 -> 通知模板（零跨包 import：事件数据由编排层经 payload 传入）
 _EVENT_TEMPLATES: dict[str, dict[str, str]] = {
     "followup_due": {
@@ -132,10 +160,13 @@ _CITATION = (
     "儿科共识 Rec17 (Scielo 2024, 引 Furth 2018); "
     "PRNT 2025 人体测量 CKD5D 每月 (Pediatr Nephrol 40:69-84)"
 )
-# 基础间隔（天）：儿科共识 Rec17 —— G1-2 每 1-2 次/年(180d)，G3-4 每 ≥3-4 次/年(90d)，
-# G5 每 >4 次/年(60d)，G5D 每月(30d，PRNT 2025)
+# 基础间隔（天）：儿科共识 Rec17 —— G1-2 每 1-2 次/年(180d)，G3a 每 ≥3-4 次/年(90d)，
+# G3b（eGFR 30-44，进展风险高于 G3a）每 ≥5-6 次/年(60d)，G4 每 ≥3-4 次/年(90d)，
+# G5 每 >4 次/年(60d)，G5D 每月(30d，PRNT 2025)。
+# BUG-50（2026-08-12）：G3b 从 90d 收窄到 60d——KDIGO 2024 建议 G3b 随访频于 G3a
+# （原实现两档同 90d，eGFR 30-44 的进展风险未体现）。
 _BASE_INTERVAL_DAYS = {
-    "G1": 180, "G2": 180, "G3a": 90, "G3b": 90, "G4": 90, "G5": 60, "G5D": 30,
+    "G1": 180, "G2": 180, "G3a": 90, "G3b": 60, "G4": 90, "G5": 60, "G5D": 30,
 }
 # 白蛋白尿升级：A2 缩短 30 天，A3 缩短 60 天（下限 14 天）
 _ALBUMINURIA_REDUCTION = {"A1": 0, "A2": 30, "A3": 60}
@@ -269,10 +300,11 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
         "created_by": caller,
         "created_at": _now_iso(),
     }
-    store = _load_store()
-    p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
-    p["plans"].append(plan)
-    _save_store(store)
+    with _STORE_LOCK:
+        store = _load_store()
+        p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
+        p["plans"].append(plan)
+        _save_store(store)
     # 写操作由临床角色发起，返回完整计划
     return {"ok": True, "data": {"plan": plan}}
 
@@ -280,16 +312,21 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
 # ---------------------------------------------------------------------------
 # 3. 随访记录时间线（读）
 # ---------------------------------------------------------------------------
-def get_followup_records(patient_id: str) -> dict[str, Any]:
+def get_followup_records(patient_id: str, guardian_token: str | None = None) -> dict[str, Any]:
     """读取某患者随访记录与计划（读，所有角色可读）。
 
     权限：临床角色（医生/营养/编排/风险）看到完整记录（含医生备注）；
     患者/家属角色（parent_assistant/child_companion）仅见摘要——原始医生备注被剔除。
+    BUG-40（2026-08-12）：家长读取必须携带 guardian_token 完成患儿绑定核验
+    （此前家长可传任意 patient_id 跨患者读取随访摘要）。
     身份缺省取部署注入值（A207_CALLER），模型不可自证（P0-1）。
     """
     caller = get_caller()
     # 双轨制清理：统一走 enforce_read 中枢
     denied = _guard(MCP_NAME, "get_followup_records", write=False)
+    if denied:
+        return denied
+    denied = _guard_guardian(caller, patient_id, guardian_token, "get_followup_records")
     if denied:
         return denied
     store = _load_store()
@@ -330,10 +367,11 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
         "created_by": caller,
         "created_at": _now_iso(),
     }
-    store = _load_store()
-    p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
-    p["records"].append(rec)
-    _save_store(store)
+    with _STORE_LOCK:
+        store = _load_store()
+        p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
+        p["records"].append(rec)
+        _save_store(store)
     # BUG-32（2026-08-12）：返回统一 {ok, data} 信封（与其他写操作一致）
     return {"ok": True, "data": {"record": rec}}
 
@@ -357,6 +395,10 @@ def calc_adherence_score(diet_ratio: float, med_ratio: float, visit_ratio: float
     """
     if not (0.0 <= diet_ratio <= 1.0 and 0.0 <= med_ratio <= 1.0 and 0.0 <= visit_ratio <= 1.0):
         return {"ok": False, "error": "INVALID_INPUT", "detail": "各比率须在 0-1 之间"}
+    # BUG-43（2026-08-12）：权重必须归一（和=1），否则 composite 可超 100（如全 0.5 → 满分 150）
+    if abs(sum(weights) - 1.0) > 1e-6:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"weights 之和必须为 1（归一化权重），收到和={sum(weights):.3f}"}
     composite = 100.0 * (weights[0] * diet_ratio + weights[1] * med_ratio + weights[2] * visit_ratio)
     level = "good" if composite >= 80 else "fair" if composite >= 50 else "poor"
     return {
@@ -397,10 +439,11 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
         "components": res["data"]["components"],
         "recorded_by": caller,
     }
-    store = _load_store()
-    p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
-    p["adherence"].append(snap)
-    _save_store(store)
+    with _STORE_LOCK:
+        store = _load_store()
+        p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
+        p["adherence"].append(snap)
+        _save_store(store)
     res["data"]["patient_id"] = patient_id
     res["data"]["history"] = p["adherence"]
     return res
@@ -412,16 +455,21 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
 _PEW_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
-def get_pew_timeline(patient_id: str, pew_history: list[dict] | None = None) -> dict[str, Any]:
+def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
+                     pew_history: list[dict] | None = None) -> dict[str, Any]:
     """PEW 时间线聚合 facade（ADR-007）。
 
     数据归属 M3（a207-nutrition-assessment-mcp-nfyy）：每次 assess_pew_risk 后由编排层调
     M3.record_pew_risk 落库，M3.get_pew_history 读取。M4 仅作 facade——本工具接受 M3
     返回的 pew_history（list of {date, score, level}）再并入统一随访时间线。零跨包 import。
     P1-2：本工具原名 get_pew_history，与 M3 同名接口易混淆双跳，已更名为 get_pew_timeline。
+    BUG-40（2026-08-12）：家长读取必须携带 guardian_token（此前可跨患者读 PEW 趋势）。
     """
     caller = get_caller()
     denied = _guard(MCP_NAME, "get_pew_timeline", write=False)
+    if denied:
+        return denied
+    denied = _guard_guardian(caller, patient_id, guardian_token, "get_pew_timeline")
     if denied:
         return denied
     ph = pew_history or []
@@ -457,27 +505,30 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     denied = _guard(MCP_NAME, "create_notification", write=True)
     if denied:
         return denied
-    store = _notify_load()
-    nid = "N" + uuid.uuid4().hex[:12].upper()
-    rec = {
-        "id": nid,
-        "patient_id": patient_id,
-        "category": category,
-        "priority": priority,
-        "title": title,
-        "body": body,
-        "created_at": _now_iso(),
-        "due_at": due_at,
-        "source_event": source_event,
-        # 已读状态（ack_notification 置 acked，幂等）
-        "status": "unacked",
-        # 闭环工作流状态（update_notification_status 严格一步推进，BUG-10/11/12）
-        "workflow_status": "unacked",
-        "status_updated_by": None,
-        "status_updated_at": None,
-    }
-    store[nid] = rec
-    _notify_save(store)
+    with _STORE_LOCK:
+        store = _notify_load()
+        nid = "N" + uuid.uuid4().hex[:12].upper()
+        rec = {
+            "id": nid,
+            "patient_id": patient_id,
+            "category": category,
+            "priority": priority,
+            "title": title,
+            "body": body,
+            "created_at": _now_iso(),
+            "due_at": due_at,
+            "source_event": source_event,
+            # 已读状态（ack_notification 置 acked，幂等）
+            "status": "unacked",
+            # 闭环工作流状态（update_notification_status 严格一步推进，BUG-10/11/12）
+            "workflow_status": "unacked",
+            # BUG-46：escalated 独立布尔（escalate_notification 置 true），与 workflow_status 正交
+            "escalated": False,
+            "status_updated_by": None,
+            "status_updated_at": None,
+        }
+        store[nid] = rec
+        _notify_save(store)
     return {"ok": True, "data": {"notification": rec}}
 
 
@@ -506,23 +557,30 @@ def build_event_notification(event_type: str, patient_id: str, payload: dict[str
 
 def get_notifications(patient_id: str,
                       status: str = "all",
-                      workflow_status: str = "all") -> dict[str, Any]:
+                      workflow_status: str = "all",
+                      escalated: bool | None = None,
+                      guardian_token: str | None = None) -> dict[str, Any]:
     """读取某患者的通知列表（读，所有角色可读自己患者的通知）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     - status: 已读状态过滤 all/unacked/acked（ack_notification 置 acked）
-    - workflow_status: 闭环状态过滤 all/unacked/confirmed/resolved/closed/escalated（BUG-25 修复，
+    - workflow_status: 闭环状态过滤 all/unacked/confirmed/resolved/closed（BUG-25 修复，
       需求 §5.2 家长视角需见 workflow_status 字段；医生可按"未关闭工单"快速过滤）
+    - escalated: BUG-46 独立布尔过滤（True=仅已升级 / False=仅未升级 / None=不过滤）
     BUG-37（2026-08-12）：status / workflow_status 参数校验合法值，非法值返回 INVALID_ARGUMENT
     （此前静默返回空列表，typo 难排查）。
-    返回条目含 workflow_status / status_updated_by / status_updated_at 闭环字段。
+    BUG-40（2026-08-12）：家长读取必须携带 guardian_token（此前可跨患者读通知列表）。
+    返回条目含 workflow_status / escalated / status_updated_by / status_updated_at 闭环字段。
     """
     caller = get_caller()
     denied = _guard(MCP_NAME, "get_notifications", write=False)
     if denied:
         return denied
+    denied = _guard_guardian(caller, patient_id, guardian_token, "get_notifications")
+    if denied:
+        return denied
     _VALID_STATUS = {"all", "unacked", "acked"}
-    _VALID_WORKFLOW = {"all", "unacked", "confirmed", "resolved", "closed", "escalated"}
+    _VALID_WORKFLOW = {"all", "unacked", "confirmed", "resolved", "closed"}
     if status not in _VALID_STATUS:
         return {"ok": False, "error": "INVALID_ARGUMENT",
                 "detail": f"status 必须是 {sorted(_VALID_STATUS)} 之一，收到：{status!r}"}
@@ -535,13 +593,14 @@ def get_notifications(patient_id: str,
         if r["patient_id"] == patient_id
         and (status == "all" or r["status"] == status)
         and (workflow_status == "all" or r.get("workflow_status", "unacked") == workflow_status)
+        and (escalated is None or bool(r.get("escalated", False)) == escalated)
     ]
     items.sort(key=lambda r: r["created_at"], reverse=True)
     return {"ok": True, "data": {
         "patient_id": patient_id, "count": len(items), "notifications": items}}
 
 
-def ack_notification(notification_id: str) -> dict[str, Any]:
+def ack_notification(notification_id: str, guardian_token: str | None = None) -> dict[str, Any]:
     """确认通知已读（幂等）。仅置 status=acked，**不改变** workflow_status（BUG-12）。
 
     需求 §5.2：已读确认与闭环工作流状态分离——ack 是"家长/医生已读"，闭环流转由
@@ -550,18 +609,25 @@ def ack_notification(notification_id: str) -> dict[str, Any]:
     BUG-28 说明（2026-08-12）：ack 走**读权闸门（write=False）是有意的设计意图**——
     所有拥有 P3 读权的角色（含家长）都可标记自己患者的通知已读；它不登记
     WRITE_TOOL_POLICY（ack 不产生新的业务状态、幂等、无 MX-3 收口需求）。
+    BUG-40（2026-08-12）：家长 ack 必须携带 guardian_token 且与该通知所属患者绑定
+    （此前家长传任意 notification_id 可标记任意患者通知已读）。
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     """
     caller = get_caller()
     denied = _guard(MCP_NAME, "ack_notification", write=False)
     if denied:
         return denied
-    store = _notify_load()
-    rec = store.get(notification_id)
-    if rec is None:
-        return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {notification_id} 不存在"}
-    rec["status"] = "acked"
-    _notify_save(store)
+    with _STORE_LOCK:
+        store = _notify_load()
+        rec = store.get(notification_id)
+        if rec is None:
+            return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {notification_id} 不存在"}
+        # 家长需校验与其患儿的绑定关系（先取通知所属 patient_id 再核验）
+        denied = _guard_guardian(caller, rec["patient_id"], guardian_token, "ack_notification")
+        if denied:
+            return denied
+        rec["status"] = "acked"
+        _notify_save(store)
     return {"ok": True, "data": {"notification": rec}}
 
 # ================================================================
@@ -569,17 +635,17 @@ def ack_notification(notification_id: str) -> dict[str, Any]:
 # ================================================================
 
 # 需求 §5.1：unacked → confirmed → resolved → closed（严格一步流转，禁止跳级）。
-# escalated 为 HAIP Workflow 旁路：24h 未确认自动升级，升级后由临床收尾（resolved/closed）。
+# BUG-46（2026-08-12）：escalated 从 workflow_status 的"第六态"改为**独立布尔字段**
+# （需求 §5.2：escalated 与 workflow_status 正交——通知可在 unacked/confirmed 状态下被
+# HAIP 或临床升级，升级后 workflow_status 仍保留原值、escalated=true；此前 escalated 是
+# 一个状态值，升级后丢失"升级前是否已确认"信息）。升级动作由 escalate_notification 设置。
 _WORKFLOW_ORDER = ["unacked", "confirmed", "resolved", "closed"]
-_WORKFLOW_ALLOWED = frozenset({"unacked", "confirmed", "resolved", "closed", "escalated"})
+_WORKFLOW_ALLOWED = frozenset(_WORKFLOW_ORDER)
 _WORKFLOW_TRANSITIONS: dict[str, frozenset[str]] = {
-    "unacked": frozenset({"confirmed", "escalated"}),   # confirmed=医生确认；escalated=HAIP 自动升级
-    # BUG-24 修复（2026-08-12）：confirmed 也允许 escalated —— 医生已确认后病情若再恶化，
-    # HAIP 仍需可升级该通知（需求 §5.2「24h 未确认自动升级」覆盖不了"已确认后恶化"场景）。
-    "confirmed": frozenset({"resolved", "escalated"}),
-    "escalated": frozenset({"resolved", "closed"}),
+    "unacked": frozenset({"confirmed"}),   # confirmed=医生确认
+    "confirmed": frozenset({"resolved"}),
     "resolved": frozenset({"closed"}),
-    "closed": frozenset(),                              # 终态
+    "closed": frozenset(),                 # 终态
 }
 
 
@@ -588,8 +654,9 @@ def update_notification_status(notification_id: str, new_status: str,
     """推移风险闭环状态机。仅 CKD 临床助手（MX-3 收口，BUG-04 修复）。
 
     需求 §5.1/§5.2：
-    - workflow_status 严格一步流转：unacked → confirmed → resolved → closed；
-      escalated 为 HAIP 自动升级旁路（24h 未确认），升级后可 resolved/closed 收尾。
+    - workflow_status 严格一步流转：unacked → confirmed → resolved → closed（禁止跳级）。
+    - BUG-46：escalated 是**独立布尔字段**（escalate_notification 设置），不在本状态机内——
+      升级与 workflow_status 正交，通知可在 confirmed 下被升级，升级后仍为 confirmed。
     - resolved 必须携带 resolution_note（BUG-09 修复，缺则返回 INVALID_ARGUMENT）。
     - 与 ack_notification 解耦：ack 只置已读 status，本工具只推进 workflow_status（BUG-12）。
     """
@@ -602,26 +669,57 @@ def update_notification_status(notification_id: str, new_status: str,
     if new_status not in _WORKFLOW_ALLOWED:
         return {"ok": False, "error": "INVALID_STATUS",
                 "detail": f"status 必须是 {sorted(_WORKFLOW_ALLOWED)} 之一"}
-    store = _notify_load()
-    nid = notification_id.strip()
-    rec = store.get(nid)
-    if rec is None:
-        return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
-    current = rec.get("workflow_status", "unacked")
-    if new_status == current:
-        return {"ok": True, "data": {"notification": rec}}  # 幂等
-    allowed_next = _WORKFLOW_TRANSITIONS.get(current, frozenset())
-    if new_status not in allowed_next:
-        return {"ok": False, "error": "INVALID_TRANSITION",
-                "detail": f"workflow_status 不允许从 {current} 直接转到 {new_status}"
-                          f"（严格一步流转，需求 §5.1）"}
-    if new_status == "resolved" and not (resolution_note or "").strip():
-        return {"ok": False, "error": "INVALID_ARGUMENT",
-                "detail": "resolved 必须携带 resolution_note（需求 §5.2）"}
-    rec["workflow_status"] = new_status
-    rec["status_updated_by"] = caller
-    rec["status_updated_at"] = datetime.now().isoformat()
-    if new_status == "resolved":
-        rec["resolution_note"] = resolution_note.strip()
-    _notify_save(store)
+    with _STORE_LOCK:
+        store = _notify_load()
+        nid = notification_id.strip()
+        rec = store.get(nid)
+        if rec is None:
+            return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
+        current = rec.get("workflow_status", "unacked")
+        if new_status == current:
+            return {"ok": True, "data": {"notification": rec}}  # 幂等
+        allowed_next = _WORKFLOW_TRANSITIONS.get(current, frozenset())
+        if new_status not in allowed_next:
+            return {"ok": False, "error": "INVALID_TRANSITION",
+                    "detail": f"workflow_status 不允许从 {current} 直接转到 {new_status}"
+                              f"（严格一步流转，需求 §5.1）"}
+        if new_status == "resolved" and not (resolution_note or "").strip():
+            return {"ok": False, "error": "INVALID_ARGUMENT",
+                    "detail": "resolved 必须携带 resolution_note（需求 §5.2）"}
+        rec["workflow_status"] = new_status
+        rec["status_updated_by"] = caller
+        rec["status_updated_at"] = datetime.now().isoformat()
+        if new_status == "resolved":
+            rec["resolution_note"] = resolution_note.strip()
+        _notify_save(store)
+    return {"ok": True, "data": {"notification": rec}}
+
+
+def escalate_notification(notification_id: str, reason: str = "") -> dict[str, Any]:
+    """标记通知升级（HAIP 24h 未确认自动升级 / 临床主动升级）。仅 CKD 临床助手。
+
+    BUG-46（2026-08-12）：escalated 是**独立布尔字段**，与 workflow_status 正交——
+    通知可在 unacked 或 confirmed 状态下被升级，升级后 workflow_status 保持原值、
+    escalated=true（此前 escalated 是 workflow_status 的一个状态值，升级会丢失
+    "升级前是否已确认"信息）。已关闭（closed）的工单不可再升级。
+    """
+    caller = get_caller()
+    denied = _guard(MCP_NAME, "escalate_notification", write=True)
+    if denied:
+        return denied
+    with _STORE_LOCK:
+        store = _notify_load()
+        nid = notification_id.strip()
+        rec = store.get(nid)
+        if rec is None:
+            return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
+        if rec.get("workflow_status") == "closed":
+            return {"ok": False, "error": "INVALID_ARGUMENT",
+                    "detail": "已关闭工单不可再升级"}
+        rec["escalated"] = True
+        rec["escalated_by"] = caller
+        rec["escalated_at"] = datetime.now().isoformat()
+        if reason.strip():
+            rec["escalation_reason"] = reason.strip()
+        _notify_save(store)
     return {"ok": True, "data": {"notification": rec}}

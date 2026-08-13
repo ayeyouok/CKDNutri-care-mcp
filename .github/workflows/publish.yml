@@ -22,6 +22,9 @@ jobs:
           python-version: "3.x"
       - name: Clean previous builds
         run: rm -rf dist/
+      - name: Check a207-policy dependency resolvable on PyPI
+        run: |
+          python -c "import urllib.request,json; d=json.load(urllib.request.urlopen('https://pypi.org/pypi/a207-policy/json')); assert '0.3.16' in d['releases'], 'a207-policy==0.3.16 未发布到 PyPI，必须先发布 a207-policy 再发布本包'"
       - name: Install build
         run: python -m pip install build --user
       - name: Build package

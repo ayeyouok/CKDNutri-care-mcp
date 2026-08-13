@@ -20,24 +20,23 @@
 """
 from __future__ import annotations
 
-import json
+import math
 import os
 import threading
 import uuid
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any, Optional
 
 from a207_policy import (
     FOLLOWUP_CLINICIAN,
     PermissionDenied,
-    atomic_write_json,
     enforce_read,
     enforce_write,
     get_caller,
-    resolve_state_path,
     verify_guardian_token,
 )
+
+from .repository import get_repository
 
 STORE_FILENAME = "followup_store.json"
 DATA_DIR_ENV = "A207_FOLLOWUP_DATA_DIR"
@@ -54,52 +53,24 @@ _CLINICIAN = FOLLOWUP_CLINICIAN
 _NOTIFY_STORE_FILENAME = "notification_store.json"
 _NOTIFY_DATA_DIR_ENV = "A207_NOTIFICATION_DATA_DIR"
 
-# BUG-53（2026-08-12）：通知/随访存储的 read-modify-write 并发保护——
-# atomic_write_json 只防单次写半截断，不防两请求读-改-写丢更新；
-# 所有写路径的 load→改→save 序列必须持 _STORE_LOCK（单进程内串行化）。
+# 并发正确性（四审，2026-08-12）：
+# - BUG-53 起：atomic_write_json 只防单次写半截断，不防两请求读-改-写丢更新；
+#   所有写路径的 load→改→save 序列必须持 _STORE_LOCK（单进程内串行化）。
+# - v2.4 起存储走 repository（JSON ↔ Tablestore 双后端）：_STORE_LOCK 定位降级为
+#   **进程内优化**（减少乐观锁冲突重试），不再是正确性保证——Tablestore 后端
+#   的写原子性由 repository 的 _rev 版本列 + 条件更新（乐观锁）保证（跨进程/多
+#   worker 部署安全）；JSON 后端维持单进程语义（多进程 JSON 本身不支持，迁移
+#   Tablestore 是正解，见 repository.py 模块 docstring）。
 _STORE_LOCK = threading.Lock()
 
 # 设计说明（2026-08-12 复核）：通知库按 notification_id 为根**扁平存储**是有意取舍——
 # ack/update/escalate 均按 nid O(1) 直查（高频路径）；get_notifications 按 patient_id
-# 过滤是 O(N) 全表遍历（低频读）。文件 JSON 每次读本就全量加载（无索引可言），
-# 儿科单中心量级下遍历开销可忽略；改按 patient_id 嵌套会破坏 nid 直查结构、
-# 波及 create/ack/update/escalate 四处，纯负收益。若未来量级增长到万级通知，
-# 再评估换 SQLite/按患者分片。
-
-
-def _notify_store_path() -> Path:
-    """通知写库路径：A207_NOTIFICATION_DATA_DIR override，否则落到 A207_DATA_DIR。"""
-    override = os.environ.get(_NOTIFY_DATA_DIR_ENV)
-    if override:
-        return Path(override) / _NOTIFY_STORE_FILENAME
-    return resolve_state_path(_NOTIFY_STORE_FILENAME)
-
-
-def _notify_load() -> dict[str, Any]:
-    try:
-        with open(_notify_store_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError as exc:
-        # BUG-65（2026-08-12）：损坏文件禁止静默返回 {} —— 否则下次 _notify_save 会用
-        # 空字典覆盖整个通知库，历史数据永久丢失。改为抛错，由 server._invalid 归
-        # INTERNAL_ERROR（fail-closed，运维可发现并恢复备份）。
-        raise RuntimeError(
-            f"通知库 {_notify_store_path().name} JSON 损坏，拒绝加载（防止静默清空），"
-            f"请检查磁盘/恢复备份: {exc}") from exc
-    # BUG-67（2026-08-12）：合法 JSON 但非 dict（null/[]/"str"）同样拒绝——json.load
-    # 正常返回非字典，后续 store.get()/setdefault() 抛 AttributeError 掩盖"类型损坏"真相。
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            f"通知库 {_notify_store_path().name} 数据类型错误：期望 dict，"
-            f"实际为 {type(data).__name__}，拒绝加载（防止静默清空）")
-    return data
-
-
-def _notify_save(store: dict[str, Any]) -> None:
-    # OD-014：原子写，避免半写截断静默丢数据
-    atomic_write_json(_notify_store_path(), store)
+# 过滤是 O(N) 全表遍历（低频读）。Tablestore 后端 notification_store 以 notification_id
+# 为主键（行模型天然 O(1) 直查），get_notifications 用 GetRange 全表过滤——与 JSON
+# 端语义一致，儿科单中心量级开销可忽略。若未来量级增长到万级通知，再评估
+# patient_id 二级索引。
+# 存储读写统一走 repository（JSON ↔ Tablestore 双后端，v2.4）：路径解析、损坏文件
+# fail-closed、原子写、乐观锁全部收敛到 repository.py，core 不再直接操作文件。
 
 
 def _forbidden(role: str, action: str) -> dict[str, Any]:
@@ -201,41 +172,10 @@ _MIN_INTERVAL = 14
 # ---------------------------------------------------------------------------
 # 存储助手
 # ---------------------------------------------------------------------------
-def store_path() -> Path:
-    """可写写库路径（P1-3 修复：不再写只读安装目录）。
-
-    - 若设 A207_FOLLOWUP_DATA_DIR（开发/测试态），落到该目录；
-    - 否则经 a207_policy.resolve_state_path 落到 A207_DATA_DIR 或系统临时目录。
-    """
-    override = os.environ.get(DATA_DIR_ENV)
-    if override:
-        return Path(override) / STORE_FILENAME
-    return resolve_state_path(STORE_FILENAME)
-
-
-def _load_store() -> dict:
-    try:
-        with open(store_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError as exc:
-        # BUG-65（2026-08-12）：同 _notify_load——损坏文件抛错（fail-closed），
-        # 禁止静默返回 {} 后被 _save_store 覆盖成空库。
-        raise RuntimeError(
-            f"随访库 {store_path().name} JSON 损坏，拒绝加载（防止静默清空），"
-            f"请检查磁盘/恢复备份: {exc}") from exc
-    # BUG-67（2026-08-12）：合法 JSON 但非 dict（null/[]/"str"）同样拒绝（同 _notify_load）
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            f"随访库 {store_path().name} 数据类型错误：期望 dict，"
-            f"实际为 {type(data).__name__}，拒绝加载（防止静默清空）")
-    return data
-
-
-def _save_store(store: dict) -> None:
-    # OD-014（P2-3）：原子写，避免半写截断静默丢数据
-    atomic_write_json(store_path(), store)
+# 随访存储读写统一走 repository（v2.4 双后端）：按 patient_id 分片
+# （load_followup/save_followup），路径解析、损坏文件 fail-closed（BUG-65/67）、
+# 原子写、Tablestore 乐观锁全部收敛到 repository.py。写路径仍持 _STORE_LOCK
+# （进程内优化，见上方并发正确性说明）。
 
 
 def _now_iso() -> str:
@@ -244,6 +184,30 @@ def _now_iso() -> str:
 
 def _today() -> str:
     return date.today().isoformat()
+
+
+def _require_iso_date(value: Any, field: str = "visit_date",
+                      allow_future: bool = True) -> str:
+    """校验日期串为 YYYY-MM-DD 并返回规范化值（C/D，2026-08-12 三审）。
+
+    - schedule_followup 的 visit_date 是计划基准日期（今日/过去均可，allow_future=True）；
+    - add_followup_record 是"实际完成"的就诊记录，未来日期为脏数据（allow_future=False，
+      对齐 P1 models.LabResultIn report_date 未来日期拒绝口径）。
+    显式校验比 date.fromisoformat 的裸 ValueError 更友好（detail 直接说明格式契约），
+    且 fail-closed：非法格式不进 next_due_date 计算，杜绝脏值静默穿透。
+    """
+    try:
+        # 严格 %Y-%m-%d 精确匹配——date.fromisoformat 在 3.11+ 会接受 "20260801" 等
+        # 紧凑格式与契约不符；strptime 精确格式对 "20260801"/"2026-8-1"/"2026/08/01"
+        # 一律拒绝（fail-closed）。
+        d = datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} 必须为 YYYY-MM-DD 格式，收到：{value!r}")
+    if not allow_future and d > date.today():
+        raise ValueError(
+            f"{field} {d.isoformat()} 晚于当前日期 {date.today().isoformat()}，"
+            "疑似未来数据，拒绝写入（实际就诊记录不应来自未来）")
+    return d.isoformat()
 
 
 def _add_days(iso_date: str, days: int) -> str:
@@ -323,6 +287,8 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
     denied = _guard(MCP_NAME, "schedule_followup", write=True)
     if denied:
         return denied
+    # C（2026-08-12 三审）：visit_date 显式 YYYY-MM-DD 校验（计划基准日期，允许过去/今日）
+    visit_date = _require_iso_date(visit_date, "visit_date")
     rec = recommend_followup_interval(ckd_stage, albuminuria_stage)
     if not rec["ok"]:
         return rec
@@ -344,10 +310,14 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
         "created_at": _now_iso(),
     }
     with _STORE_LOCK:
-        store = _load_store()
-        p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
+        p = get_repository().load_followup(patient_id)
+        if p is None:
+            p = {"records": [], "plans": [], "adherence": []}
+        p.setdefault("records", [])
+        p.setdefault("plans", [])
+        p.setdefault("adherence", [])
         p["plans"].append(plan)
-        _save_store(store)
+        get_repository().save_followup(patient_id, p)
     # 写操作由临床角色发起，返回完整计划
     return {"ok": True, "data": {"plan": plan}}
 
@@ -372,14 +342,19 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
     denied = _guard_guardian(caller, patient_id, guardian_token, "get_followup_records")
     if denied:
         return denied
-    store = _load_store()
-    p = store.get(patient_id)
+    p = get_repository().load_followup(patient_id)
     if not p:
         return {"ok": True, "data": {
             "patient_id": patient_id, "records": [], "plans": [],
-            "message": "无随访数据", "visibility": "summary_only"}}
-    records = [_visible_record(r, caller) for r in p["records"]]
-    plans = [_visible_plan(pl, caller) for pl in p["plans"]]
+            "message": "无随访数据",
+            # E（2026-08-12 三审）：无数据分支 visibility 按调用方角色返回——
+            # 此前固定 "summary_only" 会让临床角色误以为视图被裁剪（实际只是无数据）。
+            "visibility": "full" if caller in _CLINICIAN else "summary_only"}}
+    # A（2026-08-12 三审）：p["records"]/p["plans"] 硬索引改 .get() 防御——
+    # 早期版本/手工编辑的 store 可能缺 "plans" 键（setdefault 默认结构未写入时），
+    # 硬索引 KeyError 且被 server _invalid 归 INTERNAL_ERROR，掩盖"脏数据"真相。
+    records = [_visible_record(r, caller) for r in (p.get("records") or [])]
+    plans = [_visible_plan(pl, caller) for pl in (p.get("plans") or [])]
     return {
         "ok": True,
         "data": {
@@ -393,12 +368,17 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
 
 def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_stage: str,
                         indicators_snapshot: dict, plan_summary: str, doctor_notes: str = "") -> dict[str, Any]:
-    """追加一条随访记录（内部助手，供编排层/医生写入；不在 MCP 工具直接暴露，由 router 调 server 封装）。"""
+    """追加一条随访记录（写，仅临床角色；server.add_followup_record_tool 直接暴露）。
+    G（2026-08-12 三审）：docstring 修正——此前写"不在 MCP 工具直接暴露，由 router 调
+    server 封装"，但 server.py 已注册 add_followup_record_tool，属文档-实现漂移。"""
     caller = get_caller()
     # 双轨制清理：统一走 enforce_write 中枢（MX-3 写工具白名单，与 schedule_followup 一致）
     denied = _guard(MCP_NAME, "add_followup_record", write=True)
     if denied:
         return denied
+    # C/D（2026-08-12 三审）：visit_date 显式校验——随访记录是"实际完成"的就诊，
+    # 未来日期为脏数据拒绝（对齐 P1 report_date 未来拒绝口径）。
+    visit_date = _require_iso_date(visit_date, "visit_date", allow_future=False)
     rec = {
         "record_id": _short_id("FR", patient_id),
         "visit_date": visit_date,
@@ -411,10 +391,14 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
         "created_at": _now_iso(),
     }
     with _STORE_LOCK:
-        store = _load_store()
-        p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
+        p = get_repository().load_followup(patient_id)
+        if p is None:
+            p = {"records": [], "plans": [], "adherence": []}
+        p.setdefault("records", [])
+        p.setdefault("plans", [])
+        p.setdefault("adherence", [])
         p["records"].append(rec)
-        _save_store(store)
+        get_repository().save_followup(patient_id, p)
     # BUG-32（2026-08-12）：返回统一 {ok, data} 信封（与其他写操作一致）
     return {"ok": True, "data": {"record": rec}}
 
@@ -443,6 +427,14 @@ def calc_adherence_score(diet_ratio: float, med_ratio: float, visit_ratio: float
     if len(weights) != 3:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"weights 必须包含 3 个元素（diet/medication/visit 权重），收到 {len(weights)} 个"}
+    # H（2026-08-12 三审）：元素级数值+有限性校验——server 层已做 isinstance+isfinite
+    # 三层防线，但 core 为纯函数库可被编排层直调（绕过 server），补同口径防御：
+    # bool 是 int 子类、NaN/Inf 穿透类型检查后 sum/乘加产生错误结果或写库 JSON 序列化失败。
+    # 与同函数其他校验一致返回 INVALID_INPUT 信封（不抛异常，core 契约）。
+    if not all(isinstance(w, (int, float)) and not isinstance(w, bool) and math.isfinite(w)
+               for w in weights):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": "weights 所有元素必须为有限数值（int/float，不含 bool/NaN/Inf）"}
     # BUG-43（2026-08-12）：权重必须归一（和=1），否则 composite 可超 100（如全 0.5 → 满分 150）
     if abs(sum(weights) - 1.0) > 1e-6:
         return {"ok": False, "error": "INVALID_INPUT",
@@ -493,10 +485,14 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
         "recorded_by": caller,
     }
     with _STORE_LOCK:
-        store = _load_store()
-        p = store.setdefault(patient_id, {"records": [], "plans": [], "adherence": []})
+        p = get_repository().load_followup(patient_id)
+        if p is None:
+            p = {"records": [], "plans": [], "adherence": []}
+        p.setdefault("records", [])
+        p.setdefault("plans", [])
+        p.setdefault("adherence", [])
         p["adherence"].append(snap)
-        _save_store(store)
+        get_repository().save_followup(patient_id, p)
     res["data"]["patient_id"] = patient_id
     res["data"]["history"] = p["adherence"]
     return res
@@ -607,7 +603,6 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     if denied:
         return denied
     with _STORE_LOCK:
-        store = _notify_load()
         nid = "N" + uuid.uuid4().hex[:12].upper()
         rec = {
             "id": nid,
@@ -628,8 +623,7 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
             "status_updated_by": None,
             "status_updated_at": None,
         }
-        store[nid] = rec
-        _notify_save(store)
+        get_repository().save_notification(nid, rec)
     return {"ok": True, "data": {"notification": rec}}
 
 
@@ -699,16 +693,19 @@ def get_notifications(patient_id: str,
     if workflow_status not in _VALID_WORKFLOW:
         return {"ok": False, "error": "INVALID_ARGUMENT",
                 "detail": f"workflow_status 必须是 {sorted(_VALID_WORKFLOW)} 之一，收到：{workflow_status!r}"}
-    store = _notify_load()
     items = [
-        r for r in store.values()
-        if r["patient_id"] == patient_id
-        and (status == "all" or r["status"] == status)
+        r for r in get_repository().all_notifications()
+        # B（2026-08-12 三审）：r["patient_id"]/r["status"] 硬索引改 .get() 统一——
+        # 与下方 workflow_status/escalated 的 .get 风格一致，旧版本/手工写入缺键
+        # 记录不再 KeyError（此前混入缺键记录时整次读取崩溃）。
+        if r.get("patient_id") == patient_id
+        and (status == "all" or r.get("status") == status)
         and (workflow_status == "all" or r.get("workflow_status", "unacked") == workflow_status)
         and (escalated is None or bool(r.get("escalated", False)) == escalated)
     ]
     # BUG-65（2026-08-12）：safe get 排序键——硬取 r["created_at"] 时，旧版本数据（早期
-    # 版本未写入该字段）会抛 KeyError。缺省 "" 排到最前（最旧），避免崩溃。
+    # 版本未写入该字段）会抛 KeyError。缺省 "" 经 reverse=True 降序后排**末尾**
+    # （最旧位置，列表头部为最新），避免崩溃；注释修正：空串实为"最旧排末尾"而非"排最前"。
     items.sort(key=lambda r: r.get("created_at", ""), reverse=True)
     return {"ok": True, "data": {
         "patient_id": patient_id, "count": len(items), "notifications": items}}
@@ -732,8 +729,7 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
     if denied:
         return denied
     with _STORE_LOCK:
-        store = _notify_load()
-        rec = store.get(notification_id)
+        rec = get_repository().load_notification(notification_id)
         if rec is None:
             return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {notification_id} 不存在"}
         # 家长需校验与其患儿的绑定关系（先取通知所属 patient_id 再核验）
@@ -741,7 +737,7 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
         if denied:
             return denied
         rec["status"] = "acked"
-        _notify_save(store)
+        get_repository().save_notification(notification_id, rec)
     return {"ok": True, "data": {"notification": rec}}
 
 # ================================================================
@@ -784,9 +780,8 @@ def update_notification_status(notification_id: str, new_status: str,
         return {"ok": False, "error": "INVALID_STATUS",
                 "detail": f"status 必须是 {sorted(_WORKFLOW_ALLOWED)} 之一"}
     with _STORE_LOCK:
-        store = _notify_load()
         nid = notification_id.strip()
-        rec = store.get(nid)
+        rec = get_repository().load_notification(nid)
         if rec is None:
             return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
         current = rec.get("workflow_status", "unacked")
@@ -798,7 +793,7 @@ def update_notification_status(notification_id: str, new_status: str,
                 rec["resolution_note"] = note
                 rec["status_updated_by"] = caller
                 rec["status_updated_at"] = _now_iso()
-                _notify_save(store)
+                get_repository().save_notification(nid, rec)
             return {"ok": True, "data": {"notification": rec}}  # 幂等
         allowed_next = _WORKFLOW_TRANSITIONS.get(current, frozenset())
         if new_status not in allowed_next:
@@ -815,7 +810,7 @@ def update_notification_status(notification_id: str, new_status: str,
         rec["status_updated_at"] = _now_iso()
         if new_status == "resolved":
             rec["resolution_note"] = resolution_note.strip()
-        _notify_save(store)
+        get_repository().save_notification(nid, rec)
     return {"ok": True, "data": {"notification": rec}}
 
 
@@ -832,9 +827,8 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
     if denied:
         return denied
     with _STORE_LOCK:
-        store = _notify_load()
         nid = notification_id.strip()
-        rec = store.get(nid)
+        rec = get_repository().load_notification(nid)
         if rec is None:
             return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
         if rec.get("workflow_status") == "closed":
@@ -846,5 +840,5 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
         rec["escalated_at"] = _now_iso()
         if reason.strip():
             rec["escalation_reason"] = reason.strip()
-        _notify_save(store)
+        get_repository().save_notification(nid, rec)
     return {"ok": True, "data": {"notification": rec}}

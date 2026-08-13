@@ -99,8 +99,135 @@ def test_parent_guardian_binding():
         assert r.get("ok") is True and r["data"]["notification"]["status"] == "acked", r
 
 
+def test_visit_date_validation():
+    """C/D（2026-08-12 三审）回归：visit_date 格式/未来日期 fail-closed。"""
+    from CKDNutri_care_mcp import core
+
+    def _raises(fn, label):
+        try:
+            fn()
+        except ValueError:
+            return
+        raise AssertionError(f"期望 {label} 抛 ValueError")
+
+    # 非法格式：schedule_followup（计划基准日期）拒绝非 ISO 格式
+    _raises(lambda: core.schedule_followup("P001", "G3a", "A2", "outpatient", "2026/08/01"),
+            "schedule_followup 非法日期格式")
+    _raises(lambda: core.schedule_followup("P001", "G3a", "A2", "outpatient", "20260801"),
+            "schedule_followup 非 ISO 格式")
+    # 未来日期：add_followup_record（实际就诊记录）拒绝
+    from datetime import date, timedelta
+    future = (date.today() + timedelta(days=7)).isoformat()
+    _raises(lambda: core.add_followup_record("P001", future, "outpatient", "G3a", {},
+                                             "plan"), "add_followup_record 未来日期")
+    # 合法日期不误拦
+    r = core.schedule_followup("P001", "G3a", "A2", "outpatient", date.today().isoformat())
+    assert r.get("ok") is True, r
+
+
+def test_adherence_weights_validation():
+    """H（2026-08-12 三审）回归：weights 元素级数值/有限性校验（core 直调防线）。
+
+    core 契约：校验失败返回 {ok:false, error:INVALID_INPUT} 信封（不抛异常）。
+    """
+    from CKDNutri_care_mcp import core
+
+    def _invalid(fn, label):
+        r = fn()
+        assert r.get("ok") is False and r.get("error") == "INVALID_INPUT", f"{label}: {r}"
+
+    _invalid(lambda: core.calc_adherence_score(0.8, 0.9, 0.7,
+                                               weights=(1 / 3, 1 / 3, float("nan"))),
+             "weights 含 NaN")
+    _invalid(lambda: core.calc_adherence_score(0.8, 0.9, 0.7,
+                                               weights=(1 / 3, 1 / 3, float("inf"))),
+             "weights 含 Inf")
+    _invalid(lambda: core.calc_adherence_score(0.8, 0.9, 0.7, weights=(True, 0.0, 0.0)),
+             "weights 含 bool")
+    # 合法权重不误拦
+    r = core.calc_adherence_score(0.8, 0.9, 0.7)
+    assert r.get("ok") is True and r["data"]["composite_score"] >= 0
+
+
+def test_store_missing_keys_defensive():
+    """A（2026-08-12 三审）回归：store 缺 plans 键不崩溃（.get() 防御）。"""
+    import tempfile
+
+    from CKDNutri_care_mcp import core
+
+    tmp = tempfile.mkdtemp(prefix="a207-care-keys-")
+    os.environ["A207_FOLLOWUP_DATA_DIR"] = tmp
+    try:
+        # 手工构造缺 "plans" 键的 store（模拟早期版本/脏数据）
+        import json as _json
+        (Path(tmp) / core.STORE_FILENAME).write_text(
+            _json.dumps({"P001": {"records": [{"record_id": "R1", "visit_date": "2026-08-01",
+                                               "doctor_notes": "x"}]}}),
+            encoding="utf-8")
+        r = core.get_followup_records("P001")
+        assert r.get("ok") is True, r
+        # 缺 plans 键不影响 records 读取（.get() 防御），临床角色可见完整记录
+        assert len(r["data"]["records"]) == 1, r
+        # 无数据分支 visibility 按临床角色返回 full（E）
+        empty = core.get_followup_records("P9999")
+        assert empty["data"]["visibility"] == "full", empty
+    finally:
+        os.environ.pop("A207_FOLLOWUP_DATA_DIR", None)
+
+
+def test_repository_backend():
+    """四审（2026-08-12）回归：存储双后端（默认 JSON 零回归 + Tablestore fail-fast +
+    LocalJson 损坏文件 fail-closed）。"""
+    import tempfile
+
+    from CKDNutri_care_mcp import repository as repo_mod
+
+    # 默认后端 = LocalJson
+    repo = repo_mod.get_repository()
+    assert isinstance(repo, repo_mod.LocalJsonRepository), type(repo)
+    # Tablestore 后端缺连接参数 → fail-fast（不静默回退）
+    os.environ["A207_STORAGE_BACKEND"] = "tablestore"
+    try:
+        repo_mod.get_repository()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Tablestore 缺连接参数应 fail-fast")
+    finally:
+        repo_mod._REPO_CACHE.pop("tablestore", None)
+        os.environ["A207_STORAGE_BACKEND"] = "json"
+
+    tmp = tempfile.mkdtemp(prefix="a207-care-repo-")
+    os.environ["A207_FOLLOWUP_DATA_DIR"] = tmp
+    os.environ["A207_NOTIFICATION_DATA_DIR"] = tmp
+    try:
+        # LocalJson 读写（随访 + 通知）
+        assert repo.load_followup("P001") is None
+        repo.save_followup("P001", {"records": [{"r": 1}], "plans": [], "adherence": []})
+        assert repo.load_followup("P001")["records"][0]["r"] == 1
+        repo.save_notification("N1", {"id": "N1", "patient_id": "P001", "status": "unacked"})
+        assert repo.load_notification("N1")["status"] == "unacked"
+        assert len(repo.all_notifications()) == 1
+        # 损坏文件 fail-closed（防静默清空，B1 同口径）
+        import json as _json
+        (Path(tmp) / repo_mod.FOLLOWUP_STORE_FILENAME).write_text("{broken", encoding="utf-8")
+        try:
+            repo.load_followup("P001")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("损坏随访库应抛 RuntimeError")
+    finally:
+        os.environ.pop("A207_FOLLOWUP_DATA_DIR", None)
+        os.environ.pop("A207_NOTIFICATION_DATA_DIR", None)
+
+
 if __name__ == "__main__":
     test_server_imports()
     test_notification_lifecycle()
     test_parent_guardian_binding()
+    test_visit_date_validation()
+    test_adherence_weights_validation()
+    test_store_missing_keys_defensive()
+    test_repository_backend()
     print("P3 SMOKE OK")

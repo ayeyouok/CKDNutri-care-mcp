@@ -602,6 +602,12 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     denied = _guard(MCP_NAME, "create_notification", write=True)
     if denied:
         return denied
+    # 六审（2026-08-13）：priority 枚举校验（fail-closed）——LLM/编排层可能传
+    # "urgent"/"critical" 等随意值，污染通知列表的优先级语义（过滤/排序/升级逻辑
+    # 依赖 low/medium/high 三态）。非法值显式 INVALID_INPUT，不静默落库。
+    if priority not in ("low", "medium", "high"):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"priority 必须是 low / medium / high，收到：{priority!r}"}
     with _STORE_LOCK:
         nid = "N" + uuid.uuid4().hex[:12].upper()
         rec = {

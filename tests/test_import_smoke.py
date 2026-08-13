@@ -12,6 +12,9 @@ import tempfile
 from pathlib import Path
 
 os.environ.setdefault("A207_CALLER", "doctor_assistant")
+# v0.6（2026-08-13）：存储默认 Tablestore（生产）；测试显式用 json 后端（LocalJson，
+# 与旧行为一致），Tablestore 后端语义由 test_repository_backend 覆盖。
+os.environ.setdefault("A207_STORAGE_BACKEND", "json")
 # 把通知存储指向临时目录，避免污染仓库产物
 _TMP = tempfile.mkdtemp(prefix="a207-care-test-")
 os.environ["A207_NOTIFICATION_DATA_DIR"] = _TMP
@@ -176,26 +179,33 @@ def test_store_missing_keys_defensive():
 
 
 def test_repository_backend():
-    """四审（2026-08-12）回归：存储双后端（默认 JSON 零回归 + Tablestore fail-fast +
-    LocalJson 损坏文件 fail-closed）。"""
+    """v0.6（2026-08-13）回归：后端语义——缺省 tablestore（缺参 fail-fast）+
+    LocalJson 开发模式读写 + 损坏文件 fail-closed。"""
     import tempfile
 
     from CKDNutri_care_mcp import repository as repo_mod
 
-    # 默认后端 = LocalJson
-    repo = repo_mod.get_repository()
-    assert isinstance(repo, repo_mod.LocalJsonRepository), type(repo)
-    # Tablestore 后端缺连接参数 → fail-fast（不静默回退）
-    os.environ["A207_STORAGE_BACKEND"] = "tablestore"
+    # 缺省后端 = tablestore（生产），缺 OTS 参数 → fail-fast（不静默回退）
+    saved = os.environ.pop("A207_STORAGE_BACKEND", None)
     try:
-        repo_mod.get_repository()
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("Tablestore 缺连接参数应 fail-fast")
+        try:
+            repo_mod.get_repository()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("缺省 tablestore 后端缺连接参数应 fail-fast")
     finally:
-        repo_mod._REPO_CACHE.pop("tablestore", None)
-        os.environ["A207_STORAGE_BACKEND"] = "json"
+        if saved is not None:
+            os.environ["A207_STORAGE_BACKEND"] = saved
+
+    # 显式 json → LocalJson（开发模式）
+    os.environ["A207_STORAGE_BACKEND"] = "json"
+    try:
+        repo = repo_mod.get_repository()
+        assert isinstance(repo, repo_mod.LocalJsonRepository), type(repo)
+    finally:
+        if saved is not None:
+            os.environ["A207_STORAGE_BACKEND"] = saved
 
     tmp = tempfile.mkdtemp(prefix="a207-care-repo-")
     os.environ["A207_FOLLOWUP_DATA_DIR"] = tmp
@@ -209,7 +219,6 @@ def test_repository_backend():
         assert repo.load_notification("N1")["status"] == "unacked"
         assert len(repo.all_notifications()) == 1
         # 损坏文件 fail-closed（防静默清空，B1 同口径）
-        import json as _json
         (Path(tmp) / repo_mod.FOLLOWUP_STORE_FILENAME).write_text("{broken", encoding="utf-8")
         try:
             repo.load_followup("P001")
@@ -222,6 +231,23 @@ def test_repository_backend():
         os.environ.pop("A207_NOTIFICATION_DATA_DIR", None)
 
 
+def test_s4_unauthorized_nan():
+    """S4（2026-08-13）补全：越权（家长建通知）+ NaN 比率。"""
+    from CKDNutri_care_mcp import core
+
+    # ① 越权：create_notification 仅 {doctor, risk}（矩阵），家长必须 FORBIDDEN 信封
+    os.environ["A207_CALLER"] = "parent_assistant"
+    try:
+        r = core.create_notification("P001", "cat", "high", "标题", "内容")
+    finally:
+        os.environ["A207_CALLER"] = "doctor_assistant"
+    assert r.get("ok") is False and r.get("error") == "FORBIDDEN", r
+
+    # ② NaN：比率 NaN 拒绝（INVALID_INPUT 信封，不崩溃）
+    r = core.calc_adherence_score(float("nan"), 0.5, 0.5)
+    assert r.get("ok") is False and r.get("error") == "INVALID_INPUT", r
+
+
 if __name__ == "__main__":
     test_server_imports()
     test_notification_lifecycle()
@@ -230,4 +256,5 @@ if __name__ == "__main__":
     test_adherence_weights_validation()
     test_store_missing_keys_defensive()
     test_repository_backend()
+    test_s4_unauthorized_nan()
     print("P3 SMOKE OK")

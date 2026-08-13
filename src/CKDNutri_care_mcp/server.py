@@ -317,16 +317,21 @@ def get_notifications_tool(
     workflow_status: WorkflowStatus = "all",
     escalated: Optional[bool] = None,
     guardian_token: Optional[str] = None,
+    page: Optional[int] = None,
+    page_size: int = 50,
 ) -> dict[str, Any]:
     """查通知列表。status 按已读（all/unacked/acked）；workflow_status 按闭环状态
     （all/unacked/confirmed/resolved/closed）；escalated 按升级布尔过滤
     （升级与 workflow_status 正交）；家长需携带 guardian_token。
+    page/page_size（P2 修复 2026-08-13）：可选分页——page=None 返回全量（兼容），
+    传 page 则分页（page_size 默认 50、上限 200 钳制），避免通知多时灌爆上下文。
     """
     # 2026-08-12（BUG-25/46 + 系统性审查/五审）：workflow_status 过滤 BUG-25 新增、
     # escalated 独立布尔 BUG-46；status/workflow_status 去 Optional（防 null 穿透）并
     # 统一使用头部别名（防双处漂移）。
     return get_notifications(patient_id=patient_id, status=status, workflow_status=workflow_status,
-                             escalated=escalated, guardian_token=guardian_token)
+                             escalated=escalated, guardian_token=guardian_token,
+                             page=page, page_size=page_size)
 
 
 @mcp.tool

@@ -34,11 +34,11 @@ def test_notification_lifecycle():
     from CKDNutri_care_mcp import core
 
     created = core.create_notification(
-        patient_id="P001", category="followup_due",
+        patient_id="P0001", category="followup_due",
         priority="high", title="随访到期", body="P001 需复查",
     )
     assert created.get("ok") is True
-    got = core.get_notifications(patient_id="P001")
+    got = core.get_notifications(patient_id="P0001")
     assert got["data"]["count"] >= 1
     nid = got["data"]["notifications"][0]["id"]
     assert core.ack_notification(nid).get("ok") is True
@@ -73,7 +73,7 @@ def test_parent_guardian_binding():
     tok = secrets.token_urlsafe(32)
     store_dir = Path(_TMP)
     (store_dir / "guardian_tokens.json").write_text(
-        json.dumps({"P001": {
+        json.dumps({"P0001": {
             "token": tok,
             "issued_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "issued_by": "doctor_assistant",
@@ -81,22 +81,22 @@ def test_parent_guardian_binding():
         }}), encoding="utf-8")
 
     with a207_policy.as_caller("doctor_assistant"):
-        nid = core.create_notification("P001", "followup_due", "high", "t", "b")["data"]["notification"]["id"]
+        nid = core.create_notification("P0001", "followup_due", "high", "t", "b")["data"]["notification"]["id"]
 
     with a207_policy.as_caller("parent_assistant"):
         # 无 token → GUARDIAN_UNVERIFIED
-        for fn, args in ((core.get_followup_records, ("P001",)),
-                         (core.get_notifications, ("P001",)),
-                         (core.get_pew_timeline, ("P001",))):
+        for fn, args in ((core.get_followup_records, ("P0001",)),
+                         (core.get_notifications, ("P0001",)),
+                         (core.get_pew_timeline, ("P0001",))):
             r = fn(*args)
             assert r.get("ok") is False and r.get("error") == "GUARDIAN_UNVERIFIED", r
         r = core.ack_notification(nid)
         assert r.get("ok") is False and r.get("error") == "GUARDIAN_UNVERIFIED", r
         # 错误 token → FORBIDDEN
-        r = core.get_followup_records("P001", guardian_token="wrong-token")
+        r = core.get_followup_records("P0001", guardian_token="wrong-token")
         assert r.get("ok") is False and r.get("error") == "FORBIDDEN", r
         # 正确 token → 放行（受限摘要视图）
-        r = core.get_followup_records("P001", guardian_token=tok)
+        r = core.get_followup_records("P0001", guardian_token=tok)
         assert r.get("ok") is True and r["data"]["visibility"] == "summary_only", r
         r = core.ack_notification(nid, guardian_token=tok)
         assert r.get("ok") is True and r["data"]["notification"]["status"] == "acked", r
@@ -114,17 +114,17 @@ def test_visit_date_validation():
         raise AssertionError(f"期望 {label} 抛 ValueError")
 
     # 非法格式：schedule_followup（计划基准日期）拒绝非 ISO 格式
-    _raises(lambda: core.schedule_followup("P001", "G3a", "A2", "outpatient", "2026/08/01"),
+    _raises(lambda: core.schedule_followup("P0001", "G3a", "A2", "outpatient", "2026/08/01"),
             "schedule_followup 非法日期格式")
-    _raises(lambda: core.schedule_followup("P001", "G3a", "A2", "outpatient", "20260801"),
+    _raises(lambda: core.schedule_followup("P0001", "G3a", "A2", "outpatient", "20260801"),
             "schedule_followup 非 ISO 格式")
     # 未来日期：add_followup_record（实际就诊记录）拒绝
     from datetime import date, timedelta
     future = (date.today() + timedelta(days=7)).isoformat()
-    _raises(lambda: core.add_followup_record("P001", future, "outpatient", "G3a", {},
+    _raises(lambda: core.add_followup_record("P0001", future, "outpatient", "G3a", {},
                                              "plan"), "add_followup_record 未来日期")
     # 合法日期不误拦
-    r = core.schedule_followup("P001", "G3a", "A2", "outpatient", date.today().isoformat())
+    r = core.schedule_followup("P0001", "G3a", "A2", "outpatient", date.today().isoformat())
     assert r.get("ok") is True, r
 
 
@@ -164,10 +164,10 @@ def test_store_missing_keys_defensive():
         # 手工构造缺 "plans" 键的 store（模拟早期版本/脏数据）
         import json as _json
         (Path(tmp) / core.STORE_FILENAME).write_text(
-            _json.dumps({"P001": {"records": [{"record_id": "R1", "visit_date": "2026-08-01",
+            _json.dumps({"P0001": {"records": [{"record_id": "R1", "visit_date": "2026-08-01",
                                                "doctor_notes": "x"}]}}),
             encoding="utf-8")
-        r = core.get_followup_records("P001")
+        r = core.get_followup_records("P0001")
         assert r.get("ok") is True, r
         # 缺 plans 键不影响 records 读取（.get() 防御），临床角色可见完整记录
         assert len(r["data"]["records"]) == 1, r
@@ -212,16 +212,16 @@ def test_repository_backend():
     os.environ["A207_NOTIFICATION_DATA_DIR"] = tmp
     try:
         # LocalJson 读写（随访 + 通知）
-        assert repo.load_followup("P001") is None
-        repo.save_followup("P001", {"records": [{"r": 1}], "plans": [], "adherence": []})
-        assert repo.load_followup("P001")["records"][0]["r"] == 1
-        repo.save_notification("N1", {"id": "N1", "patient_id": "P001", "status": "unacked"})
+        assert repo.load_followup("P0001") is None
+        repo.save_followup("P0001", {"records": [{"r": 1}], "plans": [], "adherence": []})
+        assert repo.load_followup("P0001")["records"][0]["r"] == 1
+        repo.save_notification("N1", {"id": "N1", "patient_id": "P0001", "status": "unacked"})
         assert repo.load_notification("N1")["status"] == "unacked"
         assert len(repo.all_notifications()) == 1
         # 损坏文件 fail-closed（防静默清空，B1 同口径）
         (Path(tmp) / repo_mod.FOLLOWUP_STORE_FILENAME).write_text("{broken", encoding="utf-8")
         try:
-            repo.load_followup("P001")
+            repo.load_followup("P0001")
         except RuntimeError:
             pass
         else:
@@ -238,7 +238,7 @@ def test_s4_unauthorized_nan():
     # ① 越权：create_notification 仅 {doctor, risk}（矩阵），家长必须 FORBIDDEN 信封
     os.environ["A207_CALLER"] = "parent_assistant"
     try:
-        r = core.create_notification("P001", "cat", "high", "标题", "内容")
+        r = core.create_notification("P0001", "cat", "high", "标题", "内容")
     finally:
         os.environ["A207_CALLER"] = "doctor_assistant"
     assert r.get("ok") is False and r.get("error") == "FORBIDDEN", r

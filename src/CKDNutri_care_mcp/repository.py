@@ -67,8 +67,66 @@ _MAX_RETRY = 3
 # 进程内锁：两后端共用（JSON 串行化 RMW；Tablestore 减少版本冲突）
 _FILE_LOCK = threading.Lock()
 
+# S5 修复（2026-08-13）：乐观锁冲突重试时**合并业务字段**而非整行覆盖——
+# 此前冲突后仅用旧 attrs 重试覆盖，高并发下后写者覆盖先写者的部分字段
+# （如通知状态机 unacked→confirmed→resolved 多步流转的中间状态丢失）。
+# 合并规则见 _merge_row（列表按元素 id 去重合并、标量 new 优先）。
+
+
+def _item_key(item: Any) -> tuple:
+    """列表元素去重键：dict 优先取业务 id 键，否则按 JSON 序列化全等。"""
+    if isinstance(item, dict):
+        for k in ("record_id", "plan_id", "notification_id", "id", "entry_id"):
+            if item.get(k) is not None:
+                return ("id", k, item[k])
+    return ("json", json.dumps(item, ensure_ascii=False, sort_keys=True))
+
+
+def _merge_lists(cur: list, new: list) -> list:
+    """列表按元素 id 去重合并（new 优先覆盖同 id，追加新元素）。"""
+    result = list(cur)
+    for item in new:
+        key = _item_key(item)
+        replaced = False
+        for index, existing in enumerate(result):
+            if _item_key(existing) == key:
+                result[index] = item  # 同 id 以 new 为准（后写者意图）
+                replaced = True
+                break
+        if not replaced:
+            result.append(item)
+    return result
+
+
+def _merge_row(current: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    """冲突重试合并：以**最新行**为底，new 非 None 字段覆盖；JSON 列表字段去重合并。
+
+    current 为存储层读回的原始属性列（列表字段是 JSON 字符串），new 为本次欲写的
+    序列化列。合并后既保留并发写者的新增（列表合并），又体现本次修改（标量覆盖）。
+    """
+    merged = dict(current)
+    for key, value in new.items():
+        cur_value = merged.get(key)
+        # 两端都是 JSON 数组字符串 → 反序列化按 id 去重合并
+        if isinstance(cur_value, str) and isinstance(value, str):
+            try:
+                cur_list = json.loads(cur_value)
+                new_list = json.loads(value)
+                if isinstance(cur_list, list) and isinstance(new_list, list):
+                    merged[key] = json.dumps(_merge_lists(cur_list, new_list),
+                                             ensure_ascii=False)
+                    continue
+            except (json.JSONDecodeError, TypeError):
+                pass
+        merged[key] = value
+    return merged
+
 # repository 实例缓存（按 backend 缓存，切换 env 后重建；Tablestore 避免每请求重握手）
+# N6 修复（2026-08-13）：加 _REPO_CACHE_LOCK——当前同步路径 double-check 竞态危害低
+# （重复构建 TablestoreRepository 惰性建连幂等），但 async 化后多协程并发首调会
+# 重复建连/重复校验 OTS 参数，持锁串行化。
 _REPO_CACHE: dict[str, CareRepository] = {}
+_REPO_CACHE_LOCK = threading.Lock()
 
 # 随访默认结构（与 core 历史 setdefault 语义一致）
 DEFAULT_FOLLOWUP = {"records": [], "plans": [], "adherence": []}
@@ -264,7 +322,12 @@ class TablestoreRepository:
     def _save_row_with_optimistic_lock(
             self, table: str, pk: list[tuple[str, str]],
             attrs: dict[str, Any]) -> None:
-        """乐观锁写入：读 _rev → 条件写 _rev+1 → 冲突重试。"""
+        """乐观锁写入：读 _rev → 条件写 _rev+1 → 冲突重试。
+
+        S5 修复（2026-08-13）：冲突重试时用 _merge_row **重新读取并合并**最新行与
+        本次 attrs（此前整行覆盖旧 attrs → 高并发下后写覆盖先写的部分字段，lost update）。
+        列表字段（records/plans/adherence）按元素 id 去重合并，标量 new 优先。
+        """
         from tablestore import OTSClientError
 
         last_err: Exception | None = None
@@ -272,6 +335,8 @@ class TablestoreRepository:
             current = self._get_row(table, pk)
             rev = int(current.get(_REV_COL, 0)) if current else 0
             next_attrs = dict(attrs)
+            if current:
+                next_attrs = _merge_row(current, next_attrs)  # S5：合并并发修改
             next_attrs[_REV_COL] = rev + 1
             try:
                 self._put_row_conditioned(
@@ -408,9 +473,12 @@ def get_repository() -> CareRepository:
     backend = os.environ.get(STORAGE_BACKEND_ENV, "tablestore").strip().lower()
     repo = _REPO_CACHE.get(backend)
     if repo is None:
-        repo = (TablestoreRepository() if backend != "json"
-                else LocalJsonRepository())
-        _REPO_CACHE[backend] = repo
+        with _REPO_CACHE_LOCK:  # N6：double-check 防并发首调重复构建
+            repo = _REPO_CACHE.get(backend)
+            if repo is None:
+                repo = (TablestoreRepository() if backend != "json"
+                        else LocalJsonRepository())
+                _REPO_CACHE[backend] = repo
     return repo
 
 

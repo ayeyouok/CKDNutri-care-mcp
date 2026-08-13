@@ -24,7 +24,7 @@ import math
 import os
 import threading
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from a207_policy import (
@@ -33,6 +33,7 @@ from a207_policy import (
     enforce_read,
     enforce_write,
     get_caller,
+    validate_patient_id,
     verify_guardian_token,
 )
 
@@ -179,7 +180,9 @@ _MIN_INTERVAL = 14
 
 
 def _now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    """带时区 UTC 时间戳（P1-8 修复 2026-08-13）——此前 datetime.now() naive 本地
+    时间，与 gate.py 的 timezone.utc 比较/跨实例一致性冲突；统一 UTC+aware。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _today() -> str:
@@ -282,6 +285,13 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
     :param note_to_clinician: 仅供医生/营养的备注（患者/家属不可见）
     """
     caller = get_caller()
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
+    # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+
     # 双轨制清理（2026-08-12）：统一走 enforce_write 中枢（MX-3 + 矩阵回查），
     # 不再本地判断 _WRITE_ALLOWED（策略收紧时本地集合不会同步生效）。
     denied = _guard(MCP_NAME, "schedule_followup", write=True)
@@ -335,6 +345,13 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
     身份缺省取部署注入值（A207_CALLER），模型不可自证（P0-1）。
     """
     caller = get_caller()
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
+    # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+
     # 双轨制清理：统一走 enforce_read 中枢
     denied = _guard(MCP_NAME, "get_followup_records", write=False)
     if denied:
@@ -372,6 +389,13 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
     G（2026-08-12 三审）：docstring 修正——此前写"不在 MCP 工具直接暴露，由 router 调
     server 封装"，但 server.py 已注册 add_followup_record_tool，属文档-实现漂移。"""
     caller = get_caller()
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
+    # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+
     # 双轨制清理：统一走 enforce_write 中枢（MX-3 写工具白名单，与 schedule_followup 一致）
     denied = _guard(MCP_NAME, "add_followup_record", write=True)
     if denied:
@@ -468,6 +492,13 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
     orchestrator / child_companion 角色名，避免误导）。
     """
     caller = get_caller()
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
+    # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+
     # BUG-65（2026-08-12）：统一走 _guard 中枢（与其他写工具同口径）——此前裸调
     # enforce_write，越权抛 PermissionDenied 依赖 server._invalid 兜底转 FORBIDDEN；
     # _guard 直接返回 FORBIDDEN 信封，行为一致且不依赖调用方异常捕获路径。
@@ -531,6 +562,13 @@ def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
     BUG-40（2026-08-12）：家长读取必须携带 guardian_token（此前可跨患者读 PEW 趋势）。
     """
     caller = get_caller()
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
+    # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+
     denied = _guard(MCP_NAME, "get_pew_timeline", write=False)
     if denied:
         return denied
@@ -598,6 +636,13 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     （需求 §5.2：家长视角 get_notifications 需看到 workflow_status 字段）。
     """
     caller = get_caller()
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
+    # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+
     # 双轨制清理：统一走 enforce_write 中枢（MX-3：create_notification 已登记，doctor/risk）
     denied = _guard(MCP_NAME, "create_notification", write=True)
     if denied:
@@ -608,6 +653,25 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     if priority not in ("low", "medium", "high"):
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"priority 必须是 low / medium / high，收到：{priority!r}"}
+    # P1-8 修复（2026-08-13）：due_at 格式校验（fail-closed）——此前 due_at 原样
+    # 落库不校验，畸形值（"明天"、随机串）污染通知到期语义且无法排序。
+    # 合法：YYYY-MM-DD 日期 或 ISO 8601 datetime（可含时区）。非空即校验。
+    if due_at is not None and due_at != "":
+        _due_ok = False
+        try:
+            date.fromisoformat(str(due_at)[:10])
+            _due_ok = True
+        except ValueError:
+            pass
+        if not _due_ok:
+            try:
+                datetime.fromisoformat(str(due_at))
+                _due_ok = True
+            except ValueError:
+                pass
+        if not _due_ok:
+            return {"ok": False, "error": "INVALID_ARGUMENT",
+                    "detail": f"due_at 必须为 YYYY-MM-DD 或 ISO 8601 时间串，收到：{due_at!r}"}
     with _STORE_LOCK:
         nid = "N" + uuid.uuid4().hex[:12].upper()
         rec = {
@@ -642,6 +706,19 @@ def build_event_notification(event_type: str, patient_id: str, payload: dict[str
     risk_escalation->from_level,to_level,rule；report_ready->(无需额外字段)。
     """
     caller = get_caller()
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
+    # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+
+    # S10 修复（2026-08-13）：工具入口显式鉴权——此前本函数是 server 暴露的工具，
+    # 鉴权**隐式依赖**下游 create_notification 的 enforce_write（若下游重构/换实现
+    # 即开越权口）。集中式原则：入口自己 enforce，下游再 enforce 属防御纵深不冗余。
+    denied = _guard(MCP_NAME, "build_event_notification", write=True)
+    if denied:
+        return denied
     tpl = _EVENT_TEMPLATES.get(event_type)
     if tpl is None:
         return {"ok": False, "error": "INVALID_EVENT", "detail": f"未知事件类型: {event_type}"}
@@ -656,6 +733,11 @@ def build_event_notification(event_type: str, patient_id: str, payload: dict[str
     except KeyError as exc:
         return {"ok": False, "error": "INVALID_PAYLOAD",
                 "detail": f"事件 {event_type} 缺少字段: {exc}"}
+    except (ValueError, TypeError) as exc:
+        # N5 修复（2026-08-13）：畸形 payload（值类型与模板占位符不匹配、非法格式
+        # 说明符等）此前抛 500（INTERNAL_ERROR）；统一转 INVALID_PAYLOAD 信封。
+        return {"ok": False, "error": "INVALID_PAYLOAD",
+                "detail": f"事件 {event_type} 模板填充失败（payload 值非法）: {exc}"}
     return create_notification(
         patient_id=patient_id, category=tpl["category"], priority=tpl["priority"],
         title=tpl["title"], body=body,
@@ -666,7 +748,9 @@ def get_notifications(patient_id: str,
                       status: str = "all",
                       workflow_status: str = "all",
                       escalated: bool | None = None,
-                      guardian_token: str | None = None) -> dict[str, Any]:
+                      guardian_token: str | None = None,
+                      page: int | None = None,
+                      page_size: int = 50) -> dict[str, Any]:
     """读取某患者的通知列表（读，所有角色可读自己患者的通知）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
@@ -674,12 +758,21 @@ def get_notifications(patient_id: str,
     - workflow_status: 闭环状态过滤 all/unacked/confirmed/resolved/closed（BUG-25 修复，
       需求 §5.2 家长视角需见 workflow_status 字段；医生可按"未关闭工单"快速过滤）
     - escalated: BUG-46 独立布尔过滤（True=仅已升级 / False=仅未升级 / None=不过滤）
+    - page/page_size（P2 修复 2026-08-13）：分页——此前全量返回，通知多时灌爆 LLM
+      上下文。page 缺省 None=不分页（保持兼容）；page_size 默认 50、上限 200 钳制。
     BUG-37（2026-08-12）：status / workflow_status 参数校验合法值，非法值返回 INVALID_ARGUMENT
     （此前静默返回空列表，typo 难排查）。
     BUG-40（2026-08-12）：家长读取必须携带 guardian_token（此前可跨患者读通知列表）。
     返回条目含 workflow_status / escalated / status_updated_by / status_updated_at 闭环字段。
     """
     caller = get_caller()
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
+    # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+
     denied = _guard(MCP_NAME, "get_notifications", write=False)
     if denied:
         return denied
@@ -713,8 +806,24 @@ def get_notifications(patient_id: str,
     # 版本未写入该字段）会抛 KeyError。缺省 "" 经 reverse=True 降序后排**末尾**
     # （最旧位置，列表头部为最新），避免崩溃；注释修正：空串实为"最旧排末尾"而非"排最前"。
     items.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    # P2 修复（2026-08-13）：分页（page=None 保持全量兼容；page_size 上限 200 钳制）
+    total = len(items)
+    if page is not None:
+        if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+            return {"ok": False, "error": "INVALID_ARGUMENT",
+                    "detail": "page 必须为 ≥1 的整数"}
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
+            return {"ok": False, "error": "INVALID_ARGUMENT",
+                    "detail": "page_size 必须为 ≥1 的整数"}
+        page_size = min(page_size, 200)
+        start = (page - 1) * page_size
+        page_items = items[start:start + page_size]
+        return {"ok": True, "data": {
+            "patient_id": patient_id, "count": len(page_items),
+            "total": total, "page": page, "page_size": page_size,
+            "has_more": start + page_size < total, "notifications": page_items}}
     return {"ok": True, "data": {
-        "patient_id": patient_id, "count": len(items), "notifications": items}}
+        "patient_id": patient_id, "count": total, "notifications": items}}
 
 
 def ack_notification(notification_id: str, guardian_token: str | None = None) -> dict[str, Any]:
@@ -739,7 +848,13 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
         if rec is None:
             return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {notification_id} 不存在"}
         # 家长需校验与其患儿的绑定关系（先取通知所属 patient_id 再核验）
-        denied = _guard_guardian(caller, rec["patient_id"], guardian_token, "ack_notification")
+        # P2 修复（2026-08-13）：rec["patient_id"] 硬索引改 .get()——旧版本/手工写入
+        # 缺该键的记录此前直接 KeyError（server _invalid 归 INTERNAL_ERROR，掩盖脏数据）。
+        _pid = rec.get("patient_id")
+        if _pid is None:
+            return {"ok": False, "error": "INVALID_ARGUMENT",
+                    "detail": f"通知 {notification_id} 缺少 patient_id（脏数据），拒绝 ack"}
+        denied = _guard_guardian(caller, _pid, guardian_token, "ack_notification")
         if denied:
             return denied
         rec["status"] = "acked"

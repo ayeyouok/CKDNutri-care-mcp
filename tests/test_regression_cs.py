@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """C-S1/C-S2/C-B3/C-B4/C-B7/D1 回归测试（2026-08-14 修复后固化）。pytest + 直接运行双模式。"""
 import os
+os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 import sys
 from pathlib import Path
 

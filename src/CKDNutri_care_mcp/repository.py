@@ -482,11 +482,12 @@ def ensure_tablestore_tables() -> None:
         options = TableOptions(time_to_live=-1, max_version=1)
         throughput = ReservedThroughput(capacity_unit=CapacityUnit(0, 0))
         client.create_table(meta, options, throughput)
-        print(f"[ensure] 已创建表 {table_name}")
+        logger.info("[ensure] 已创建表 %s", table_name)
 
     _create(TABLE_FOLLOWUP, [("patient_id", "STRING")])
     _create(TABLE_NOTIFICATION, [("notification_id", "STRING")])
-    print(f"[ensure] Tablestore 表就绪：{sorted(existing | {TABLE_FOLLOWUP, TABLE_NOTIFICATION})}")
+    logger.info("[ensure] Tablestore 表就绪：%s",
+                sorted(existing | {TABLE_FOLLOWUP, TABLE_NOTIFICATION}))
 
 
 def get_repository() -> CareRepository:

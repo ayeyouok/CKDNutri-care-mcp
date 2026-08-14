@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from a207_policy import (
     FOLLOWUP_CLINICIAN,
+    PARENT_ROLE,
     PermissionDenied,
     enforce_read,
     enforce_write,
@@ -105,7 +106,7 @@ def _guard_guardian(caller: str, patient_id: str, guardian_token: str | None,
     （含过期校验，单一事实源，不在此维护副本）；家长必须携带与其患儿绑定的
     guardian_token 才能访问。
     """
-    if caller != "parent_assistant":
+    if caller != PARENT_ROLE:
         return None
     if not guardian_token:
         return {"ok": False, "error": "GUARDIAN_UNVERIFIED",

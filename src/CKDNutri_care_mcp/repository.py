@@ -210,9 +210,12 @@ class LocalJsonRepository:
         return p
 
     def save_followup(self, patient_id: str, data: dict[str, Any]) -> None:
+        # C-S1 修复（2026-08-14）：部分更新语义（与 Tablestore 端 _merge_row 对齐）——
+        # 此前整体替换 store[pid]=data，core 若传完整快照会在并发/重试时覆盖并发者
+        # 的新增标量字段。现在以存储行为底、data 字段覆盖（data 应为本次变更子集）。
         with _FILE_LOCK:
             store = _read_json_file(_followup_json_path(), "随访库")
-            store[patient_id] = data
+            store[patient_id] = {**store.get(patient_id, {}), **data}
             atomic_write_json(_followup_json_path(), store)
 
     # ---- 通知 ----
@@ -222,9 +225,12 @@ class LocalJsonRepository:
         return rec if isinstance(rec, dict) else None
 
     def save_notification(self, notification_id: str, rec: dict[str, Any]) -> None:
+        # C-S1 修复（2026-08-14）：部分更新语义（与 Tablestore 端 _merge_row 对齐）——
+        # 此前整体替换 store[nid]=rec，core 传完整快照（load→改→save）时并发/重试
+        # 会覆盖并发者的 escalated 等标量字段（S5 只救了列表字段）。
         with _FILE_LOCK:
             store = _read_json_file(_notification_json_path(), "通知库")
-            store[notification_id] = rec
+            store[notification_id] = {**store.get(notification_id, {}), **rec}
             atomic_write_json(_notification_json_path(), store)
 
     def all_notifications(self) -> list[dict[str, Any]]:
@@ -343,6 +349,16 @@ class TablestoreRepository:
                     table, pk, next_attrs, rev, expect_exists=current is not None)
                 return
             except OTSClientError as exc:
+                # C-B4 修复（2026-08-14）：仅**条件检查失败**（乐观锁冲突）重试——
+                # 此前把所有 OTSClientError（鉴权失败/参数非法/表不存在等 SDK 错误）
+                # 一律当并发冲突重试 3 次后报"存储并发写冲突"，把配置/环境错误误导
+                # 成高并发问题。非冲突错误立即抛（归 INTERNAL_ERROR 定位真实根因）。
+                code = str(getattr(exc, "code", "") or "")
+                msg = str(getattr(exc, "message", "") or "")
+                is_conflict = ("ConditionCheck" in code or "ConditionCheck" in msg
+                               or "not match" in msg.lower())
+                if not is_conflict:
+                    raise
                 last_err = exc  # 条件不满足 → 并发写冲突，重试
         raise RuntimeError(
             f"存储并发写冲突（{table} pk={pk}），重试 {_MAX_RETRY} 次仍失败，"
@@ -375,14 +391,20 @@ class TablestoreRepository:
 
     @staticmethod
     def _deserialize_followup(attrs: dict[str, Any]) -> dict[str, Any]:
+        # C-B3 修复（2026-08-14）：损坏 JSON 一律抛错（fail-closed，与 JSON 端
+        # _read_json_file 同口径）——此前 except JSONDecodeError 静默置 []，读到的
+        # 空列表经 save 全量覆盖写回 → 患儿随访数据（记录/计划/依从性）**永久丢失**
+        # 且无任何告警。损坏即显式失败，交由上层定位（人工修复或降级），绝不静默。
         out: dict[str, Any] = {}
         for key in ("records", "plans", "adherence"):
             raw = attrs.get(key)
             if isinstance(raw, str):
                 try:
                     out[key] = json.loads(raw)
-                except json.JSONDecodeError:
-                    out[key] = []
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"随访数据列 {key} 损坏（非法 JSON）：{exc}——拒绝静默清空，"
+                        "请人工修复 Tablestore 该行数据") from exc
             elif isinstance(raw, list):
                 out[key] = raw
             else:

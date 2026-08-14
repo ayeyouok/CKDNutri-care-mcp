@@ -653,19 +653,30 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     if priority not in ("low", "medium", "high"):
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"priority 必须是 low / medium / high，收到：{priority!r}"}
+    # C-B7 修复（2026-08-14）：category 枚举校验（fail-closed，与 priority 对称）——
+    # 此前 category 无校验，任意串落库会污染分类语义（家长端按 category 归类展示）。
+    # 合法集合与 _EVENT_TEMPLATES 对齐：followup_due / risk_alert / report_ready。
+    if category not in ("followup_due", "risk_alert", "report_ready"):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"category 必须是 followup_due / risk_alert / report_ready，"
+                          f"收到：{category!r}"}
     # P1-8 修复（2026-08-13）：due_at 格式校验（fail-closed）——此前 due_at 原样
     # 落库不校验，畸形值（"明天"、随机串）污染通知到期语义且无法排序。
     # 合法：YYYY-MM-DD 日期 或 ISO 8601 datetime（可含时区）。非空即校验。
     if due_at is not None and due_at != "":
         _due_ok = False
+        _due_raw = str(due_at)
+        # C-S2 修复（2026-08-14）：去掉 [:10] 截断——此前 "2026-08-01garbage"[:10]
+        # = "2026-08-01" 通过校验且**原样落库**（fail-closed 被截断绕过，脏串污染
+        # 到期排序）。现在完整解析：YYYY-MM-DD 或 ISO 8601 datetime；多余字符一律拒绝。
         try:
-            date.fromisoformat(str(due_at)[:10])
+            date.fromisoformat(_due_raw)
             _due_ok = True
         except ValueError:
             pass
         if not _due_ok:
             try:
-                datetime.fromisoformat(str(due_at))
+                datetime.fromisoformat(_due_raw)
                 _due_ok = True
             except ValueError:
                 pass
@@ -844,6 +855,13 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
     if denied:
         return denied
     with _STORE_LOCK:
+        # C-B7 修复（2026-08-14）：notification_id 显式 strip + None/空拒绝——
+        # 此前未 strip（" abc " 查不到归 NOT_FOUND，语义误导）；None 穿透可能让
+        # Tablestore 端用非法主键构造请求（JSON 端 store.get(None) 返回 None 掩盖）。
+        if notification_id is None or not str(notification_id).strip():
+            return {"ok": False, "error": "INVALID_ARGUMENT",
+                    "detail": "notification_id 不能为空"}
+        notification_id = str(notification_id).strip()
         rec = get_repository().load_notification(notification_id)
         if rec is None:
             return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {notification_id} 不存在"}
@@ -858,7 +876,8 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
         if denied:
             return denied
         rec["status"] = "acked"
-        get_repository().save_notification(notification_id, rec)
+        # C-S1 修复（2026-08-14）：只传变更字段子集（防并发标量 lost update）
+        get_repository().save_notification(notification_id, {"status": "acked"})
     return {"ok": True, "data": {"notification": rec}}
 
 # ================================================================
@@ -914,7 +933,10 @@ def update_notification_status(notification_id: str, new_status: str,
                 rec["resolution_note"] = note
                 rec["status_updated_by"] = caller
                 rec["status_updated_at"] = _now_iso()
-                get_repository().save_notification(nid, rec)
+                # C-S1：变更字段子集（防并发标量 lost update）
+                get_repository().save_notification(nid, {
+                    "resolution_note": note, "status_updated_by": caller,
+                    "status_updated_at": rec["status_updated_at"]})
             return {"ok": True, "data": {"notification": rec}}  # 幂等
         allowed_next = _WORKFLOW_TRANSITIONS.get(current, frozenset())
         if new_status not in allowed_next:
@@ -929,9 +951,13 @@ def update_notification_status(notification_id: str, new_status: str,
         # BUG-65（2026-08-12）：统一 _now_iso()（秒级）——此前裸调 datetime.now().isoformat()
         # 带微秒，与 create_notification 的 _now_iso() 格式不一致，字典序排序/字符串比较会错位。
         rec["status_updated_at"] = _now_iso()
+        # C-S1 修复（2026-08-14）：只传变更字段子集（防并发标量 lost update）
+        patch = {"workflow_status": new_status, "status_updated_by": caller,
+                 "status_updated_at": rec["status_updated_at"]}
         if new_status == "resolved":
             rec["resolution_note"] = resolution_note.strip()
-        get_repository().save_notification(nid, rec)
+            patch["resolution_note"] = resolution_note.strip()
+        get_repository().save_notification(nid, patch)
     return {"ok": True, "data": {"notification": rec}}
 
 
@@ -959,7 +985,14 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
         rec["escalated_by"] = caller
         # BUG-65（2026-08-12）：统一 _now_iso()（秒级），与 create_notification 等一致
         rec["escalated_at"] = _now_iso()
+        # C-S1 修复（2026-08-14）：只传**变更字段子集**——此前传完整 rec 快照
+        # （load→改→save），并发/乐观锁重试时标量 new 覆盖会回写旧 escalated 值
+        # 覆盖并发写者（S5 只救了列表字段）。部分更新后 _merge_row/JSON 合并只
+        # 覆盖本次字段，并发者的 escalated 等保留。
+        patch = {"escalated": True, "escalated_by": caller,
+                 "escalated_at": rec["escalated_at"]}
         if reason.strip():
             rec["escalation_reason"] = reason.strip()
-        get_repository().save_notification(nid, rec)
+            patch["escalation_reason"] = reason.strip()
+        get_repository().save_notification(nid, patch)
     return {"ok": True, "data": {"notification": rec}}

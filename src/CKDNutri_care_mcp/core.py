@@ -579,8 +579,9 @@ def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
     # BUG-66（2026-08-12）：家长/患儿等非临床、非编排角色拒绝外部传入的 pew_history——
     # 该参数是 facade 的权威数据注入通道（编排层从 M3.get_pew_history 拉取后传入聚合），
     # 家长若可自行构造 pew_history（含任意 trend 方向）即可伪造 PEW 恶化/改善趋势误导下游。
-    # doctor/risk_warning/orchestrator 保留注入能力（facade 设计用途）。
-    if pew_history and caller not in _CLINICIAN and caller != "orchestrator":
+    # 潜在 2（2026-08-14）：orchestrator 角色已退役（CALLERS 仅 3 个），`caller !=
+    # "orchestrator"` 为死代码——清理。doctor/risk_warning（_CLINICIAN）保留注入能力。
+    if pew_history and caller not in _CLINICIAN:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": "家长/患儿视角不接受外部传入的 pew_history（防伪造 PEW 趋势）；"
                           "请通过编排层获取 M3 权威历史。"}
@@ -920,8 +921,12 @@ def update_notification_status(notification_id: str, new_status: str,
     if new_status not in _WORKFLOW_ALLOWED:
         return {"ok": False, "error": "INVALID_STATUS",
                 "detail": f"status 必须是 {sorted(_WORKFLOW_ALLOWED)} 之一"}
+    # 潜在 3（2026-08-14）：notification_id None 显式拒绝——此前 None.strip()
+    # 抛 AttributeError 被 server _invalid 归 INTERNAL_ERROR（500 类），误导排障。
+    if not notification_id or not str(notification_id).strip():
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": "notification_id 不能为空"}
     with _STORE_LOCK:
-        nid = notification_id.strip()
+        nid = str(notification_id).strip()
         rec = get_repository().load_notification(nid)
         if rec is None:
             return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
@@ -974,8 +979,11 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
     denied = _guard(MCP_NAME, "escalate_notification", write=True)
     if denied:
         return denied
+    # 潜在 3（2026-08-14）：None 显式拒绝（对齐 update_notification_status）
+    if not notification_id or not str(notification_id).strip():
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": "notification_id 不能为空"}
     with _STORE_LOCK:
-        nid = notification_id.strip()
+        nid = str(notification_id).strip()
         rec = get_repository().load_notification(nid)
         if rec is None:
             return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""C-S1/C-S2/C-B3/C-B4/C-B7 回归测试（2026-08-14 修复后固化）。pytest + 直接运行双模式。"""
+"""C-S1/C-S2/C-B3/C-B4/C-B7/D1 回归测试（2026-08-14 修复后固化）。pytest + 直接运行双模式。"""
 import os
 import sys
 from pathlib import Path
@@ -76,4 +76,29 @@ if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
         fn()
-    print(f"P3 C-S1/C-S2/C-B3/C-B4/C-B7 REGRESSION OK（{len(fns)} 个用例）")
+    print(f"P3 C-S1/C-S2/C-B3/C-B4/C-B7/D1 REGRESSION OK（{len(fns)} 个用例）")
+
+
+def test_d1_parent_notification_masked():
+    """D1：家长视角通知裁剪医生内部字段（resolution_note/escalation_reason 等）。
+
+    直测 _mask_notification（get_notifications / ack 共用的裁剪函数）——
+    家长读路径需 guardian_token 才能过 _guard_guardian，用 token 链路会使本测试
+    依赖 P1 签发，故直接验证裁剪函数本体（同一 _CLINICIAN 判定）。
+    """
+    from CKDNutri_care_mcp.core import _mask_notification, _NOTIF_CLINICIAN_ONLY
+
+    rec = {"id": "N-1", "patient_id": "P0001", "title": "标题", "status": "unacked",
+           "workflow_status": "resolved", "escalated": True,
+           "resolution_note": "医生处置备注-保密", "escalation_reason": "升级理由-保密",
+           "status_updated_by": "doctor_assistant", "escalated_by": "doctor_assistant"}
+    # 家长视角：医生内部字段全剥离，核心字段保留
+    masked = _mask_notification(rec, "parent_assistant")
+    for key in _NOTIF_CLINICIAN_ONLY:
+        assert key not in masked, f"家长视角泄露 {key}"
+    assert masked.get("id") and masked.get("title") and masked.get("workflow_status"), "核心字段应保留"
+    # 临床视角：原样返回
+    full = _mask_notification(rec, "doctor_assistant")
+    assert "resolution_note" in full and "escalated_by" in full, "医生视角应保留"
+    # 幂等：家长裁剪后再次裁剪无变化
+    assert _mask_notification(masked, "parent_assistant") == masked

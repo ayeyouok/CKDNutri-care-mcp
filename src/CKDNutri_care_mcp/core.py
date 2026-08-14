@@ -222,6 +222,20 @@ def _short_id(prefix: str, patient_id: str) -> str:
     return f"{prefix}-{patient_id}-{uuid.uuid4().hex[:8]}"
 
 
+# D1 修复（2026-08-14）：家长视角通知裁剪的医生内部字段（get_notifications / ack 共用）。
+# resolution_note（处置备注）/escalation_reason（升级理由）/status_updated_by（医生身份）/
+# escalated_by（升级操作者）不在 CLINICIAN_ONLY_FIELDS，须在此显式收口。
+_NOTIF_CLINICIAN_ONLY = frozenset(
+    {"resolution_note", "escalation_reason", "status_updated_by", "escalated_by"})
+
+
+def _mask_notification(rec: dict, caller: str) -> dict:
+    """非临床角色裁剪通知的医生内部字段（幂等：临床角色原样返回）。"""
+    if caller in _CLINICIAN:
+        return rec
+    return {k: v for k, v in rec.items() if k not in _NOTIF_CLINICIAN_ONLY}
+
+
 def _visible_record(rec: dict, caller: str) -> dict:
     """患者/家属角色剔除原始医生备注（doctor_notes），仅留可见摘要。"""
     out = dict(rec)
@@ -819,6 +833,12 @@ def get_notifications(patient_id: str,
     # 版本未写入该字段）会抛 KeyError。缺省 "" 经 reverse=True 降序后排**末尾**
     # （最旧位置，列表头部为最新），避免崩溃；注释修正：空串实为"最旧排末尾"而非"排最前"。
     items.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    # D1 修复（2026-08-14）：家长视角裁剪医生内部字段——此前 items 直接返回仓库原始记录，
+    # resolution_note（处置备注）/escalation_reason（升级理由）/status_updated_by（医生身份）
+    # 对家长可见，与 get_followup_records 的 _visible_record 裁剪同包两套口径；且这三键
+    # 不在 CLINICIAN_ONLY_FIELDS（matrix.py），无递归兜底。非临床角色统一剥离。
+    if caller not in _CLINICIAN:
+        items = [_mask_notification(r, caller) for r in items]
     # P2 修复（2026-08-13）：分页（page=None 保持全量兼容；page_size 上限 200 钳制）
     total = len(items)
     if page is not None:
@@ -880,7 +900,10 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
         rec["status"] = "acked"
         # C-S1 修复（2026-08-14）：只传变更字段子集（防并发标量 lost update）
         get_repository().save_notification(notification_id, {"status": "acked"})
-    return {"ok": True, "data": {"notification": rec}}
+    # D1 修复（2026-08-14）：家长 ack 返回同源裁剪（与 get_notifications 同口径）——
+    # 家长可 ack（读权闸门设计），返回的 rec 若含 resolution_note/escalation_reason/
+    # status_updated_by/escalated_by 即泄露医生内部字段。
+    return {"ok": True, "data": {"notification": _mask_notification(rec, caller)}}
 
 # ================================================================
 # 闭环状态机: update_notification_status (v2.3 / 2026-08-12 重构)

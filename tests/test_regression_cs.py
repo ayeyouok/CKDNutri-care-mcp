@@ -63,15 +63,20 @@ def test_c_b7_ack_none_rejected():
 
 
 def test_c_b3_deserialize_corrupt_raises():
-    """C-B3：Tablestore 损坏 JSON 抛错（fail-closed，不静默清空致数据永久丢失）。"""
+    """C-B3：Tablestore 损坏 JSON 抛错（fail-closed，不静默清空致数据永久丢失）。
+
+    P3-2（2026-08-15）：数据损坏改抛 RuntimeError（服务端存储问题 → INTERNAL_ERROR +
+    脱敏）——此前 ValueError 被 server 归 INVALID_INPUT（客户端错误码），与 P4 #8
+    规则库损坏同口径修正。测试同时接受两者（历史断言兼容）。
+    """
     from CKDNutri_care_mcp import repository as repo
 
     try:
         repo.TablestoreRepository._deserialize_followup({"records": "{broken"})
-    except ValueError:
+    except (ValueError, RuntimeError):
         pass
     else:
-        raise AssertionError("损坏 JSON 应抛 ValueError（静默 [] 会致 save 覆盖丢数据）")
+        raise AssertionError("损坏 JSON 应抛异常（静默 [] 会致 save 覆盖丢数据）")
 
 
 if __name__ == "__main__":

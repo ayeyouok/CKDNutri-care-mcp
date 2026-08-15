@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import threading
@@ -387,6 +388,9 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
     # 硬索引 KeyError 且被 server _invalid 归 INTERNAL_ERROR，掩盖"脏数据"真相。
     records = [_visible_record(r, caller) for r in (p.get("records") or [])]
     plans = [_visible_plan(pl, caller) for pl in (p.get("plans") or [])]
+    # P3 其余（2026-08-15）：随访记录按 visit_date 升序返回——此前原样透传存储顺序
+    # （追加序），家长/临床视角时间线混乱，趋势性阅读依赖调用方自行排序。
+    records = sorted(records, key=lambda r: str(r.get("visit_date") or ""))
     return {
         "ok": True,
         "data": {
@@ -436,6 +440,15 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
         p.setdefault("records", [])
         p.setdefault("plans", [])
         p.setdefault("adherence", [])
+        # P3 其余（2026-08-15）：幂等——同患者同 visit_date 已存在记录拒绝重复追加
+        # （随访是"实际完成"的就诊，重复提交多为重试/误操作；此前无检查会累积
+        # 重复行，get_followup_records 时间线出现双份同日记录）。
+        for existing in p.get("records") or []:
+            if existing.get("visit_date") == visit_date:
+                return {"ok": False, "error": "DUPLICATE",
+                        "detail": f"patient_id={patient_id} 在 {visit_date} 已有随访记录"
+                                  f"（{existing.get('record_id')}），拒绝重复追加；"
+                                  "如需修正请编辑已有记录"}
         p["records"].append(rec)
         get_repository().save_followup(patient_id, p)
     # BUG-32（2026-08-12）：返回统一 {ok, data} 信封（与其他写操作一致）
@@ -470,20 +483,26 @@ def calc_adherence_score(diet_ratio: float, med_ratio: float, visit_ratio: float
     # 三层防线，但 core 为纯函数库可被编排层直调（绕过 server），补同口径防御：
     # bool 是 int 子类、NaN/Inf 穿透类型检查后 sum/乘加产生错误结果或写库 JSON 序列化失败。
     # 与同函数其他校验一致返回 INVALID_INPUT 信封（不抛异常，core 契约）。
+    # P3-3（2026-08-15）：元素**非负**校验——此前 (-0.5, 1.5, 0) 和=1 通过校验，
+    # 复合分可为负或超 100（实测 (0.2,0.8,0.5) 权重 → composite=110 判 good）。
     if not all(isinstance(w, (int, float)) and not isinstance(w, bool) and math.isfinite(w)
-               for w in weights):
+               and w >= 0 for w in weights):
         return {"ok": False, "error": "INVALID_INPUT",
-                "detail": "weights 所有元素必须为有限数值（int/float，不含 bool/NaN/Inf）"}
+                "detail": "weights 所有元素必须为非负有限数值（int/float，不含 bool/NaN/Inf）"}
     # BUG-43（2026-08-12）：权重必须归一（和=1），否则 composite 可超 100（如全 0.5 → 满分 150）
     if abs(sum(weights) - 1.0) > 1e-6:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"weights 之和必须为 1（归一化权重），收到和={sum(weights):.3f}"}
     composite = 100.0 * (weights[0] * diet_ratio + weights[1] * med_ratio + weights[2] * visit_ratio)
-    level = "good" if composite >= 80 else "fair" if composite >= 50 else "poor"
+    # P3 其余（2026-08-15）：等级判定与展示值同口径——此前判定用未舍入 composite、
+    # 展示用 round(composite,1)，composite=79.96 时展示 80.0 但判 fair，用户看到的
+    # "80.0 分 + fair"自相矛盾。统一以 round 后展示值为判定基准。
+    composite_show = round(composite, 1)
+    level = "good" if composite_show >= 80 else "fair" if composite_show >= 50 else "poor"
     return {
         "ok": True,
         "data": {
-            "composite_score": round(composite, 1),
+            "composite_score": composite_show,
             "level": level,
             "components": {
                 "diet": round(diet_ratio * 100, 1),
@@ -556,14 +575,26 @@ def _parse_pew_date(value: Any) -> Optional[datetime]:
     上游 M3 契约=ISO 升序，此处防御性解析——"/"、"." 分隔转 "-" 后 fromisoformat；
     无法解析（"Yesterday"、非零填充 "2023-6-1"）返回 None，由调用方剔除
     （fail-closed：无法可靠定位时间线的数据点不参与趋势计算）。
+
+    P3-1（2026-08-15）：**先试原样 fromisoformat**（.replace 会破坏 ISO 微秒时间戳
+    "2024-01-10T08:30:00.123456"→"…00-123456"），仅原样失败才做分隔符替换；
+    返回统一 naive（tzinfo=None）——aware/naive 混排时 sort/比较抛 TypeError，
+    上游若部分点带时区偏移、部分不带会整次读取崩溃（INTERNAL_ERROR）。
     """
     raw = str(value or "").strip()
     if not raw:
         return None
+    dt = None
     try:
-        return datetime.fromisoformat(raw.replace("/", "-").replace(".", "-"))
+        dt = datetime.fromisoformat(raw)
     except ValueError:
-        return None
+        pass
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(raw.replace("/", "-").replace(".", "-"))
+        except ValueError:
+            return None
+    return dt.replace(tzinfo=None)
 
 
 def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
@@ -700,6 +731,21 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
             return {"ok": False, "error": "INVALID_ARGUMENT",
                     "detail": f"due_at 必须为 YYYY-MM-DD 或 ISO 8601 时间串，收到：{due_at!r}"}
     with _STORE_LOCK:
+        # P3 其余（2026-08-15）：同事件去重——同患者同类别同 **source_event** 的未关闭
+        # 通知不重复创建（HAIP 定时触发/编排重试会重复入队；此前无检查每次触发都
+        # 新增一行，通知列表被重复项淹没，家长收到多条同事件提醒）。
+        # **仅事件驱动通知去重**（source_event 非空）：手动创建（无 source_event）
+        # 是临床主动行为，不拦（避免临床多次建通知被误拒）。
+        if source_event:
+            dup_key = (category, str(source_event).strip())
+            for existing in get_repository().all_notifications():
+                if existing.get("patient_id") == patient_id \
+                        and (existing.get("category"), existing.get("source_event") or "") == dup_key \
+                        and existing.get("workflow_status") not in ("closed", "confirmed"):
+                    return {"ok": False, "error": "DUPLICATE",
+                            "detail": f"该事件（{category}/{source_event}）已有未关闭"
+                                      f"通知 {existing.get('id')}，拒绝重复创建；"
+                                      "可对该通知执行 ack/escalate 处理"}
         nid = "N" + uuid.uuid4().hex[:12].upper()
         rec = {
             "id": nid,
@@ -1017,12 +1063,32 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
         rec["escalated_by"] = caller
         # BUG-65（2026-08-12）：统一 _now_iso()（秒级），与 create_notification 等一致
         rec["escalated_at"] = _now_iso()
+        # P3 其余（2026-08-15）：升级审计追加——此前重复 escalate 覆盖 escalated_at/
+        # escalation_reason（最后一次升级淹没历史），审计丢失。现追加 escalated_history
+        # 列表（元素带唯一 id，存储层按 id 去重合并，并发安全），保留每次升级轨迹。
+        # 注意：存储读回该列是 **JSON 字符串**（序列化契约），需先解析为 list 再追加。
+        entry = {"id": uuid.uuid4().hex[:8], "by": caller, "at": rec["escalated_at"]}
+        if reason.strip():
+            entry["reason"] = reason.strip()
+        raw_hist = rec.get("escalated_history")
+        if isinstance(raw_hist, str):
+            try:
+                history = json.loads(raw_hist)
+            except (json.JSONDecodeError, TypeError):
+                history = []
+        elif isinstance(raw_hist, list):
+            history = list(raw_hist)
+        else:
+            history = []
+        history.append(entry)
+        rec["escalated_history"] = history
         # C-S1 修复（2026-08-14）：只传**变更字段子集**——此前传完整 rec 快照
         # （load→改→save），并发/乐观锁重试时标量 new 覆盖会回写旧 escalated 值
         # 覆盖并发写者（S5 只救了列表字段）。部分更新后 _merge_row/JSON 合并只
         # 覆盖本次字段，并发者的 escalated 等保留。
         patch = {"escalated": True, "escalated_by": caller,
-                 "escalated_at": rec["escalated_at"]}
+                 "escalated_at": rec["escalated_at"],
+                 "escalated_history": json.dumps(history, ensure_ascii=False)}
         if reason.strip():
             rec["escalation_reason"] = reason.strip()
             patch["escalation_reason"] = reason.strip()

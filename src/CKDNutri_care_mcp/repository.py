@@ -229,8 +229,12 @@ class TablestoreRepository(TablestoreBase):
                 try:
                     out[key] = json.loads(raw)
                 except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"随访数据列 {key} 损坏（非法 JSON）：{exc}——拒绝静默清空，"
+                    # P3-2（2026-08-15）：数据损坏是**服务端存储问题**，抛 RuntimeError
+                    # （归 INTERNAL_ERROR + 脱敏）——此前 ValueError 被 server 转
+                    # INVALID_INPUT（客户端错误码），误导调用方以为是入参错误，
+                    # 与 P4 #8 规则库损坏同口径修正。
+                    raise RuntimeError(
+                        f"随访数据列 {key} 损坏（非法 JSON）：拒绝静默清空，"
                         "请人工修复 Tablestore 该行数据") from exc
             elif isinstance(raw, list):
                 out[key] = raw

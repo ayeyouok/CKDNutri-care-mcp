@@ -142,6 +142,22 @@ def handle_mcp_exceptions(fn):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")  # C2（2026-08-15）：生产 stdout 可采集
+    # A3（2026-08-15）：启动 OTS 自检 fail-fast（对齐 P1）——此前缺 A207_OTS_* 参数时
+    # "服务活着但每个工具 INTERNAL_ERROR"（比启动失败更难发现，医疗数据读写全挂）。
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        from .repository import get_repository
+
+        repo = get_repository()
+        tables = repo._get_client().list_table()
+        logger.info("[ots-selfcheck] OK 已连通表格存储，表=%s", sorted(tables))
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[ots-selfcheck] FAIL 无法连接表格存储（%s）。检查 A207_OTS_* "
+            "环境变量与网络后重试；服务未启动。", type(exc).__name__)
+        raise SystemExit(1) from exc
     mcp.run()
 
 

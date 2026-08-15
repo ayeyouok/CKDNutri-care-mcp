@@ -188,7 +188,9 @@ def _now_iso() -> str:
 
 
 def _today() -> str:
-    return date.today().isoformat()
+    # C2（2026-08-15）：统一 UTC 业务日——此前 date.today() 本地 naive，跨时区
+    # 部署"今天/未来日期"判断漂移（未来日期拒绝、followup_due 到期判断全受影响）
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _require_iso_date(value: Any, field: str = "visit_date",
@@ -912,8 +914,12 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
     update_notification_status 推进（unacked→confirmed→resolved→closed）。
 
     BUG-28 说明（2026-08-12）：ack 走**读权闸门（write=False）是有意的设计意图**——
-    所有拥有 P3 读权的角色（含家长）都可标记自己患者的通知已读；它不登记
-    WRITE_TOOL_POLICY（ack 不产生新的业务状态、幂等、无 MX-3 收口需求）。
+    所有拥有 P3 读权的角色（含家长）都可标记自己患者的通知已读；ack 不产生新的
+    业务状态、幂等、无 MX-3 收口需求，故仍按读操作闸门放行。
+    #10（2026-08-15）：ack_notification 已补登记 WRITE_TOOL_POLICY（家长写操作，
+    allowed={parent,doctor}，矩阵 care×parent 升 RW）——登记不改变 ack 的读闸
+    执行路径（_guard write=False 是准入语义，登记是登记完整性），此前的"不登记"
+    注释已过时，删。
     BUG-40（2026-08-12）：家长 ack 必须携带 guardian_token 且与该通知所属患者绑定
     （此前家长传任意 notification_id 可标记任意患者通知已读）。
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。

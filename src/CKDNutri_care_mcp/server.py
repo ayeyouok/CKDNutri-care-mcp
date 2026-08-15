@@ -15,7 +15,7 @@ from typing import Any, Literal, Optional
 
 from fastmcp import FastMCP
 
-from a207_policy import CallerError
+from a207_policy import translate_error
 
 from .core import (
     ack_notification,
@@ -98,49 +98,11 @@ def _sanitize_bound_args(bound_args: Optional[dict[str, Any]]) -> dict[str, Any]
 
 def _invalid(exc: Exception, tool: str = "unknown",
              bound_args: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    # 2026-08-12（系统性审查，P1）：bound_args 为**形参名绑定的完整字典**（装饰器经
-    # inspect.signature.bind 归一化，含默认值）——位置参数与关键字参数统一收口，从根源
-    # 杜绝位置参数绕过脱敏把 guardian_token 明文写入日志；脱敏后仅用于服务端日志，
-    # 返回信封不含任何调用参数。
+    # B2 中心化（2026-08-15）：异常翻译收敛到 a207_policy.translate_error 单实现；
+    # bound_args 脱敏（guardian_token 等敏感值不进日志）保留在本层（care 特有防御）。
     safe_args = _sanitize_bound_args(bound_args)
-    if isinstance(exc, CallerError):
-        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封（与本包 _guard /
-        # clinical-data _guard_access 同格式），不再向上抛导致 500；PermissionDenied 带
-        # caller/action/reason，CallerUnknown 缺字段时降级文案。此前 get_adherence_score 等
-        # 裸调 enforce_* 的工具有越权即 500 崩溃。
-        # 2026-08-12（六审）：reason 三重保底——属性为空串 "" 时 getattr 默认值不生效
-        # （属性存在），此前会输出空括号 "（）"；None or str(exc) or 兜底文案。
-        # 2026-08-12（七审）：caller/action 亦做 or 保底——属性被显式置 None 时
-        # getattr 默认值同样不生效，会输出 "caller=None 无权 None"。
-        logger.warning("随访服务鉴权拒绝: tool=%s args=%s exc=%s", tool, safe_args, exc)
-        caller = getattr(exc, "caller", None) or "?"
-        action = getattr(exc, "action", None) or "access"
-        reason = getattr(exc, "reason", None) or str(exc) or "无明确原因"
-        return {"ok": False, "error": "FORBIDDEN",
-                "detail": f"caller={caller} 无权 {action}（{reason}）"}
-    # BUG-52（2026-08-12）：内部数据错误归 INTERNAL_ERROR，避免误归 INVALID_INPUT
-    # BUG-65（2026-08-12）：RuntimeError 补入——_load_store/_notify_load 遇 JSON 损坏时
-    # 抛 RuntimeError 包装（fail-closed 防静默清空），此前 _invalid 未覆盖，损坏会被误归
-    # INVALID_INPUT（400），违背"数据文件损坏=服务端内部错误"的归类初衷。
-    # 2026-08-12（系统性审查，P1）：detail **脱敏**——OSError/FileNotFoundError 的 str
-    # 含服务端绝对路径（如 /var/app/data/stores/patient_xxx.json），原样返回泄露内部
-    # 文件系统结构；完整异常（含路径）仅留服务端日志（logger.warning）。
-    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError, RuntimeError)):
-        logger.warning("随访服务内部数据错误: tool=%s args=%s exc=%s",
-                       tool, safe_args, exc)
-        return {"ok": False, "error": "INTERNAL_ERROR",
-                "detail": "内部数据错误（error_code=CARE_DATA），详情见服务端日志"}
-    if isinstance(exc, ValueError):
-        # core 层业务/参数校验异常（值域、范围、格式等）——detail 对调用方有明确语义，保留；
-        # info 级记录参数校验拦截（预期业务拒绝，供调用模式分析，非故障告警）。
-        logger.info("随访服务参数校验拦截: tool=%s args=%s exc=%s", tool, safe_args, exc)
-        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
-    # 未知系统异常 = 内部 Code Bug——归 INTERNAL_ERROR（编排层不应重试/误判入参问题），
-    # detail 脱敏（不泄露内部实现），完整堆栈仅服务端日志。
-    logger.error("随访服务未预期异常（内部 bug，error_code=CARE_UNKNOWN）: tool=%s args=%s",
-                 tool, safe_args, exc_info=exc)
-    return {"ok": False, "error": "INTERNAL_ERROR",
-            "detail": "随访服务内部错误（error_code=CARE_UNKNOWN），请查服务端日志"}
+    return translate_error(exc, domain="P3", logger=logger, tool=tool,
+                           safe_args=safe_args)
 
 
 def handle_mcp_exceptions(fn):

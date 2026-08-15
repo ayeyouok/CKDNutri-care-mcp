@@ -252,7 +252,7 @@ def get_pew_timeline_tool(
     guardian_token: Optional[str] = None,
     pew_history: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    """PEW 历史并入统一随访时间线（facade）。家长需携带 guardian_token。
+    """查询 PEW 历史，与随访时间线合并展示。家长需携带 guardian_token。
 
     pew_history: PEW 评估记录对象数组（每个元素为 {date, level, ...} 对象）。
     """
@@ -353,7 +353,7 @@ def update_notification_status_tool(
 @mcp.tool
 @handle_mcp_exceptions
 def escalate_notification_tool(notification_id: str, reason: str = "") -> dict[str, Any]:
-    """标记通知升级（HAIP 24h 未确认自动升级 / 临床主动升级）。仅 CKD 临床助手。
+    """标记通知升级（24h 未确认自动升级 / 临床主动升级）。仅 CKD 临床助手。
 
     升级后 workflow_status 保持原值（unacked/confirmed 皆可被升级），不丢失升级前状态。
     """

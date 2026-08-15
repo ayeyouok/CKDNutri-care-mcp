@@ -739,14 +739,19 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
         # **仅事件驱动通知去重**（source_event 非空）：手动创建（无 source_event）
         # 是临床主动行为，不拦（避免临床多次建通知被误拒）。
         if source_event:
-            dup_key = (category, str(source_event).strip())
+            # F-5（2026-08-15）：去重键加 **due_at**——随访重排场景：同类别同 source_event
+            # （如 followup_due 事件类型固定映射）但**新的到期日**应视为"新一次提醒"，
+            # 旧去重键不含 due_at 会把重排后的新提醒当重复阻断（家长收不到新 followup_due）。
+            # 含 due_at 后：同事件同到期日仍去重（防 HAIP 重试刷屏），到期日变化放行。
+            dup_key = (category, str(source_event).strip(), due_at or "")
             for existing in get_repository().all_notifications():
                 if existing.get("patient_id") == patient_id \
-                        and (existing.get("category"), existing.get("source_event") or "") == dup_key \
+                        and (existing.get("category"), existing.get("source_event") or "",
+                             existing.get("due_at") or "") == dup_key \
                         and existing.get("workflow_status") not in ("closed", "confirmed"):
                     return {"ok": False, "error": "DUPLICATE",
-                            "detail": f"该事件（{category}/{source_event}）已有未关闭"
-                                      f"通知 {existing.get('id')}，拒绝重复创建；"
+                            "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
+                                      f"已有未关闭通知 {existing.get('id')}，拒绝重复创建；"
                                       "可对该通知执行 ack/escalate 处理"}
         nid = "N" + uuid.uuid4().hex[:12].upper()
         rec = {

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "CKDNutri-care-mcp"
-version = "0.4.14"
+version = "0.4.15"
 description = "P3 随访沟通域——随访+通知+闭环工单"
 requires-python = ">=3.10"
 dependencies = [

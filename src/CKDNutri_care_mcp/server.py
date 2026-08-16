@@ -214,9 +214,17 @@ def schedule_followup_tool(
 
 @mcp.tool
 @handle_mcp_exceptions
-def get_followup_records_tool(patient_id: str, guardian_token: Optional[str] = None) -> dict[str, Any]:
-    """查随访历史（含计划 + 下次到期日）。按身份视图裁剪；家长需携带 guardian_token。"""
-    return get_followup_records(patient_id=patient_id, guardian_token=guardian_token)
+def get_followup_records_tool(patient_id: str, guardian_token: Optional[str] = None,
+                              limit: Optional[int] = None,
+                              offset: int = 0) -> dict[str, Any]:
+    """查随访历史（含计划 + 下次到期日）。按身份视图裁剪；家长需携带 guardian_token。
+
+    limit/offset（L-3，2026-08-16）：按 visit_date 升序分页——随访记录随年限增长，
+    limit 缺省返回全量（向后兼容），长病史建议传 limit 控制上下文；返回 total/
+    truncated 供调用方翻页。
+    """
+    return get_followup_records(patient_id=patient_id, guardian_token=guardian_token,
+                                limit=limit, offset=offset)
 
 
 @mcp.tool

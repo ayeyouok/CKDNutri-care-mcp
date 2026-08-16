@@ -173,6 +173,10 @@ _MIN_INTERVAL = 14
 # M3（2026-08-16，第七轮审查）：visit_type 合法值（此前 add_followup_record/
 # schedule_followup 均未校验，任意字符串落库；显式枚举 fail-closed）
 _VISIT_TYPES = frozenset({"outpatient", "phone", "online", "dialysis", "nutrition_counsel"})
+# L-3（2026-08-16，十一审）：随访记录绝对上限——防异常数据（远超正常随访量，
+# 如每日多次写入累积数十年）单次返回撑爆 LLM 上下文；正常患儿（数十年随访）
+# 也远低于此，limit=None 默认全量兼容，仅超上限截断。
+_FOLLOWUP_RECORD_CAP = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -242,14 +246,36 @@ def _mask_notification(rec: dict, caller: str) -> dict:
     """非临床角色裁剪通知的医生内部字段（幂等：临床角色原样返回）。"""
     if caller in _CLINICIAN:
         return rec
-    return {k: v for k, v in rec.items() if k not in _NOTIF_CLINICIAN_ONLY}
+    out = {k: v for k, v in rec.items() if k not in _NOTIF_CLINICIAN_ONLY}
+    # L-2（2026-08-16，十一审）：升级审计列表 escalated_history[].by 直透医生身份
+    # ——顶层 escalated_by 已剥，但历史条目里的 by（记录医生身份）漏网。家长看到
+    # 每次升级的操作者身份（PII 级）。逐元素剥 by（保留 id/at/reason 供家长了解
+    # 升级轨迹）。
+    hist = out.get("escalated_history")
+    if isinstance(hist, list):
+        out["escalated_history"] = [
+            {k2: v2 for k2, v2 in h.items() if k2 != "by"} for h in hist]
+    elif isinstance(hist, str):
+        try:
+            parsed = json.loads(hist)
+            if isinstance(parsed, list):
+                out["escalated_history"] = [
+                    {k2: v2 for k2, v2 in h.items() if k2 != "by"} for h in parsed]
+        except (json.JSONDecodeError, TypeError):
+            pass  # 脏数据：保留原样（剥除失败不 crash，父层已有 fail-closed 读取）
+    return out
 
 
 def _visible_record(rec: dict, caller: str) -> dict:
-    """患者/家属角色剔除原始医生备注（doctor_notes），仅留可见摘要。"""
+    """患者/家属角色剔除原始医生备注与医生身份，仅留可见摘要。
+
+    L-2（2026-08-16，十一审）：此前只剥 doctor_notes，created_by（记录医生身份）
+    漏网直透家长（PII 级）。现一并剥除；保留 created_at 供家长了解记录时间。
+    """
     out = dict(rec)
     if caller not in _CLINICIAN:
         out.pop("doctor_notes", None)
+        out.pop("created_by", None)
     return out
 
 
@@ -364,7 +390,9 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
 # ---------------------------------------------------------------------------
 # 3. 随访记录时间线（读）
 # ---------------------------------------------------------------------------
-def get_followup_records(patient_id: str, guardian_token: str | None = None) -> dict[str, Any]:
+def get_followup_records(patient_id: str, guardian_token: str | None = None,
+                         limit: int | None = None,
+                         offset: int = 0) -> dict[str, Any]:
     """读取某患者随访记录与计划（读，所有角色可读）。
 
     权限：临床角色（医生/营养/编排/风险）看到完整记录（含医生备注）；
@@ -372,6 +400,11 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
     BUG-40（2026-08-12）：家长读取必须携带 guardian_token 完成患儿绑定核验
     （此前家长可传任意 patient_id 跨患者读取随访摘要）。
     身份缺省取部署注入值（A207_CALLER），模型不可自证（P0-1）。
+
+    L-3（2026-08-16，十一审）：**分页**——随访记录随年限无界增长，此前无 limit
+    全量返回，LLM 上下文线性膨胀（多年随访记录直接撑爆上下文）。现支持
+    limit/offset（按 visit_date 升序分页），limit=None 时返回全量（向后兼容），
+    但超过 _FOLLOWUP_RECORD_CAP（10 万）仍截断防超限（记录数异常时保护）。
     """
     caller = get_caller()
     # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
@@ -388,6 +421,9 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
     denied = _guard_guardian(caller, patient_id, guardian_token, "get_followup_records")
     if denied:
         return denied
+    if limit is not None and (limit < 0 or offset < 0):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": "limit/offset 不能为负"}
     p = get_repository().load_followup(patient_id)
     if not p:
         return {"ok": True, "data": {
@@ -404,6 +440,14 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
     # P3 其余（2026-08-15）：随访记录按 visit_date 升序返回——此前原样透传存储顺序
     # （追加序），家长/临床视角时间线混乱，趋势性阅读依赖调用方自行排序。
     records = sorted(records, key=lambda r: str(r.get("visit_date") or ""))
+    # L-3（2026-08-16）：分页截断——超限保护（记录数异常时防 LLM 上下文爆）：
+    # limit=None 默认全量（向后兼容），显式 limit 按 offset 分页；_FOLLOWUP_RECORD_CAP
+    # 为绝对上限（远超正常随访量，仅防御异常数据）。
+    total = len(records)
+    if limit is None and total > _FOLLOWUP_RECORD_CAP:
+        records = records[:_FOLLOWUP_RECORD_CAP]
+    elif limit is not None:
+        records = records[offset:offset + limit]
     return {
         "ok": True,
         "data": {
@@ -411,6 +455,8 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
             "records": records,
             "plans": plans,
             "visibility": "full" if caller in _CLINICIAN else "summary_only",
+            "total": total,
+            "truncated": len(records) < total,
         },
     }
 
@@ -628,7 +674,12 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
         p.setdefault("records", [])
         p.setdefault("plans", [])
         p.setdefault("adherence", [])
+        # M-4（2026-08-16，十一审）：adherence 快照无界（每次评估 append 一条，无上限
+        # → 单患者依从性历史线性增长，get_followup_records 全量返回撑上下文）。
+        # 保留最近 _FOLLOWUP_RECORD_CAP 条（与随访记录同上限，远超正常评估量）。
         p["adherence"].append(snap)
+        if len(p["adherence"]) > _FOLLOWUP_RECORD_CAP:
+            p["adherence"] = p["adherence"][-_FOLLOWUP_RECORD_CAP:]
         get_repository().save_followup(patient_id, p)
     res["data"]["patient_id"] = patient_id
     res["data"]["history"] = p["adherence"]
@@ -736,11 +787,15 @@ def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
         "ok": True,
         "data": {
             "patient_id": patient_id,
-            "source": "M3 (a207-nutrition-assessment-mcp-nfyy) — ADR-007 PEW 历史归属 M3",
+            # M-2（2026-08-16，十一审）：架构语言不进家长上下文——此前 source 硬编码
+            # "M3 (a207-nutrition-assessment-mcp-nfyy) — ADR-007"（模块编号+包名），
+            # note 含 M3/M4 归属说明，家长/患儿视角暴露内部架构。改中性描述，
+            # 归属语义保留在服务端 docstring。
+            "source": "PEW 历史（营养评估）",
             "count": len(pts),
             "points": pts,
             "trend": trend,
-            "note": "M4 仅作 facade 聚合，PEW 历史存储由 M3 拥有；此工具接受 M3 get_pew_history 的输出再并入统一随访时间线。",
+            "note": "PEW 历史点按日期升序排列；趋势基于首末有效点的严重度对比。",
         },
     }
 

@@ -170,6 +170,9 @@ _BASE_INTERVAL_DAYS = {
 # 白蛋白尿升级：A2 缩短 30 天，A3 缩短 60 天（下限 14 天）
 _ALBUMINURIA_REDUCTION = {"A1": 0, "A2": 30, "A3": 60}
 _MIN_INTERVAL = 14
+# M3（2026-08-16，第七轮审查）：visit_type 合法值（此前 add_followup_record/
+# schedule_followup 均未校验，任意字符串落库；显式枚举 fail-closed）
+_VISIT_TYPES = frozenset({"outpatient", "phone", "online", "dialysis", "nutrition_counsel"})
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +213,12 @@ def _require_iso_date(value: Any, field: str = "visit_date",
         d = datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
     except (TypeError, ValueError):
         raise ValueError(f"{field} 必须为 YYYY-MM-DD 格式，收到：{value!r}")
-    if not allow_future and d > date.today():
+    # L（2026-08-16，第七轮审查）：未来日期判断统一 UTC 业务日——此前 date.today()
+    # 本地 naive，与全局 UTC 口径（_today()/_now_iso()）脱节，跨时区部署漂移。
+    if not allow_future and d > datetime.now(timezone.utc).date():
         raise ValueError(
-            f"{field} {d.isoformat()} 晚于当前日期 {date.today().isoformat()}，"
+            f"{field} {d.isoformat()} 晚于当前 UTC 日期 "
+            f"{datetime.now(timezone.utc).date().isoformat()}，"
             "疑似未来数据，拒绝写入（实际就诊记录不应来自未来）")
     return d.isoformat()
 
@@ -317,6 +323,11 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
         return denied
     # C（2026-08-12 三审）：visit_date 显式 YYYY-MM-DD 校验（计划基准日期，允许过去/今日）
     visit_date = _require_iso_date(visit_date, "visit_date")
+    # M3（2026-08-16）：visit_type 枚举校验（与 add_followup_record 同口径）
+    if visit_type not in _VISIT_TYPES:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"visit_type 必须是 {'/'.join(sorted(_VISIT_TYPES))} 之一，"
+                          f"收到 {visit_type!r}"}
     rec = recommend_followup_interval(ckd_stage, albuminuria_stage)
     if not rec["ok"]:
         return rec
@@ -424,6 +435,16 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
     # C/D（2026-08-12 三审）：visit_date 显式校验——随访记录是"实际完成"的就诊，
     # 未来日期为脏数据拒绝（对齐 P1 report_date 未来拒绝口径）。
     visit_date = _require_iso_date(visit_date, "visit_date", allow_future=False)
+    # M3（2026-08-16，第七轮审查）：visit_type/ckd_stage 枚举校验——此前任意字符串
+    # 静默落库（typo 如 "outpatinet" 产生脏数据，且后续按类型统计不可靠）。
+    if visit_type not in _VISIT_TYPES:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"visit_type 必须是 {'/'.join(sorted(_VISIT_TYPES))} 之一，"
+                          f"收到 {visit_type!r}"}
+    if ckd_stage not in _BASE_INTERVAL_DAYS:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"ckd_stage 必须是 {'/'.join(_BASE_INTERVAL_DAYS)} 之一，"
+                          f"收到 {ckd_stage!r}"}
     rec = {
         "record_id": _short_id("FR", patient_id),
         "visit_date": visit_date,
@@ -445,10 +466,14 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
         # P3 其余（2026-08-15）：幂等——同患者同 visit_date 已存在记录拒绝重复追加
         # （随访是"实际完成"的就诊，重复提交多为重试/误操作；此前无检查会累积
         # 重复行，get_followup_records 时间线出现双份同日记录）。
+        # M3（2026-08-16）：幂等键加 **visit_type**——同日不同访视（如上午门诊 +
+        # 下午营养门诊）此前被误判重复拒绝；同类型同日才是重试。
         for existing in p.get("records") or []:
-            if existing.get("visit_date") == visit_date:
+            if existing.get("visit_date") == visit_date \
+                    and existing.get("visit_type") == visit_type:
                 return {"ok": False, "error": "DUPLICATE",
-                        "detail": f"patient_id={patient_id} 在 {visit_date} 已有随访记录"
+                        "detail": f"patient_id={patient_id} 在 {visit_date} "
+                                  f"（{visit_type}）已有随访记录"
                                   f"（{existing.get('record_id')}），拒绝重复追加；"
                                   "如需修正请编辑已有记录"}
         p["records"].append(rec)
@@ -744,11 +769,16 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
             # 旧去重键不含 due_at 会把重排后的新提醒当重复阻断（家长收不到新 followup_due）。
             # 含 due_at 后：同事件同到期日仍去重（防 HAIP 重试刷屏），到期日变化放行。
             dup_key = (category, str(source_event).strip(), due_at or "")
+            # H3（2026-08-16，第七轮审查）：confirmed 也应拦——此前
+            # not in ("closed", "confirmed") 把已确认通知排除在去重外，
+            # 编排/HAIP 对同事件重试会再创建重复通知（架空去重，疑似笔误）。
+            # 去重目的：同事件不重复入队；confirmed 表示事件已处理，重试
+            # 仍应拒绝（事件未变）。仅 closed 放行（可重新开事件）。
             for existing in get_repository().all_notifications():
                 if existing.get("patient_id") == patient_id \
                         and (existing.get("category"), existing.get("source_event") or "",
                              existing.get("due_at") or "") == dup_key \
-                        and existing.get("workflow_status") not in ("closed", "confirmed"):
+                        and existing.get("workflow_status") not in ("closed",):
                     return {"ok": False, "error": "DUPLICATE",
                             "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
                                       f"已有未关闭通知 {existing.get('id')}，拒绝重复创建；"

@@ -244,10 +244,16 @@ class TablestoreRepository(TablestoreBase):
 
     @staticmethod
     def _serialize_followup(data: dict[str, Any]) -> dict[str, Any]:
+        # M4（2026-08-16，第七轮审查）：保留**全部键**——此前只序列化
+        # records/plans/adherence 三键，core 若在行上存其他字段（未来扩展）会被
+        # 丢弃，与 JSON 后端合并式写入语义不一致（潜在数据丢失）。list/dict 类
+        # JSON 序列化，标量直存。
         attrs: dict[str, Any] = {}
-        for key in ("records", "plans", "adherence"):
-            val = data.get(key)
-            attrs[key] = json.dumps(val or [], ensure_ascii=False) if val else json.dumps([], ensure_ascii=False)
+        for key, val in data.items():
+            if isinstance(val, (list, dict)):
+                attrs[key] = json.dumps(val, ensure_ascii=False)
+            else:
+                attrs[key] = val
         return attrs
 
     def load_followup(self, patient_id: str) -> dict[str, Any] | None:

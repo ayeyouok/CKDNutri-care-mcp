@@ -6,7 +6,6 @@ v2.3 新增：trigger_event_notification（DAG）+ update_notification_status（
 from __future__ import annotations
 
 import inspect
-import json
 import logging
 import math
 
@@ -141,12 +140,18 @@ def handle_mcp_exceptions(fn):
     return wrapper
 
 
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")  # C2（2026-08-15）：生产 stdout 可采集
-    # A3（2026-08-15）：启动 OTS 自检 fail-fast（对齐 P1）——此前缺 A207_OTS_* 参数时
-    # "服务活着但每个工具 INTERNAL_ERROR"（比启动失败更难发现，医疗数据读写全挂）。
+def _ots_selfcheck() -> None:
+    """启动 OTS 自检 fail-fast（A3）。**JSON 开发后端跳过**（H2，2026-08-16）：
+    LocalJsonRepository 无 _get_client（无 OTS 连接），此前无条件调用抛
+    AttributeError → SystemExit(1)——官方推荐的显式 json 开发模式无法经入口启动，
+    main() 零测试覆盖致缺陷长期未被发现。抽独立函数便于测试。"""
     import logging
+    import os
+
     logger = logging.getLogger(__name__)
+    if os.environ.get("A207_STORAGE_BACKEND", "tablestore").strip().lower() == "json":
+        logger.info("[ots-selfcheck] JSON 开发后端，跳过 OTS 连通自检")
+        return
     try:
         from .repository import get_repository
 
@@ -158,6 +163,11 @@ def main():
             "[ots-selfcheck] FAIL 无法连接表格存储（%s）。检查 A207_OTS_* "
             "环境变量与网络后重试；服务未启动。", type(exc).__name__)
         raise SystemExit(1) from exc
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")  # C2（2026-08-15）：生产 stdout 可采集
+    _ots_selfcheck()
     mcp.run()
 
 

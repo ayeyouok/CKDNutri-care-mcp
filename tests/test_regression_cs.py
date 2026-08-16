@@ -36,7 +36,7 @@ def test_c_s2_due_at_full_validation():
 
     r = core.create_notification("P0001", "followup_due", "high", "t", "b",
                                  due_at="2026-08-01garbage")
-    assert r["ok"] is False and r["error"] == "INVALID_ARGUMENT", r
+    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
     r2 = core.create_notification("P0001", "followup_due", "high", "t", "b",
                                   due_at="2026-08-01")
     assert r2["ok"] is True, r2

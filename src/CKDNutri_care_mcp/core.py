@@ -314,7 +314,7 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
     # 双轨制清理（2026-08-12）：统一走 enforce_write 中枢（MX-3 + 矩阵回查），
     # 不再本地判断 _WRITE_ALLOWED（策略收紧时本地集合不会同步生效）。
@@ -379,7 +379,7 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
     # 双轨制清理：统一走 enforce_read 中枢
     denied = _guard(MCP_NAME, "get_followup_records", write=False)
@@ -457,7 +457,7 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
     # 双轨制清理：统一走 enforce_write 中枢（MX-3 写工具白名单，与 schedule_followup 一致）
     denied = _guard(MCP_NAME, "add_followup_record", write=True)
@@ -603,7 +603,7 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
     # BUG-65（2026-08-12）：统一走 _guard 中枢（与其他写工具同口径）——此前裸调
     # enforce_write，越权抛 PermissionDenied 依赖 server._invalid 兜底转 FORBIDDEN；
@@ -685,7 +685,7 @@ def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
     denied = _guard(MCP_NAME, "get_pew_timeline", write=False)
     if denied:
@@ -760,7 +760,7 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
     # 双轨制清理：统一走 enforce_write 中枢（MX-3：create_notification 已登记，doctor/risk）
     denied = _guard(MCP_NAME, "create_notification", write=True)
@@ -800,7 +800,7 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
             except ValueError:
                 pass
         if not _due_ok:
-            return {"ok": False, "error": "INVALID_ARGUMENT",
+            return {"ok": False, "error": "INVALID_INPUT",
                     "detail": f"due_at 必须为 YYYY-MM-DD 或 ISO 8601 时间串，收到：{due_at!r}"}
     with _STORE_LOCK:
         # P3 其余（2026-08-15）：同事件去重——同患者同类别同 **source_event** 的未关闭
@@ -866,7 +866,7 @@ def build_event_notification(event_type: str, patient_id: str, payload: dict[str
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
     # S10 修复（2026-08-13）：工具入口显式鉴权——此前本函数是 server 暴露的工具，
     # 鉴权**隐式依赖**下游 create_notification 的 enforce_write（若下游重构/换实现
@@ -915,7 +915,7 @@ def get_notifications(patient_id: str,
     - escalated: BUG-46 独立布尔过滤（True=仅已升级 / False=仅未升级 / None=不过滤）
     - page/page_size（P2 修复 2026-08-13）：分页——此前全量返回，通知多时灌爆 LLM
       上下文。page 缺省 None=不分页（保持兼容）；page_size 默认 50、上限 200 钳制。
-    BUG-37（2026-08-12）：status / workflow_status 参数校验合法值，非法值返回 INVALID_ARGUMENT
+    BUG-37（2026-08-12）：status / workflow_status 参数校验合法值，非法值返回 INVALID_INPUT
     （此前静默返回空列表，typo 难排查）。
     BUG-40（2026-08-12）：家长读取必须携带 guardian_token（此前可跨患者读通知列表）。
     返回条目含 workflow_status / escalated / status_updated_by / status_updated_at 闭环字段。
@@ -926,7 +926,7 @@ def get_notifications(patient_id: str,
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
     denied = _guard(MCP_NAME, "get_notifications", write=False)
     if denied:
@@ -935,17 +935,17 @@ def get_notifications(patient_id: str,
     if denied:
         return denied
     # BUG-65（2026-08-12）：MCP 客户端显式传 JSON null（Python None）时，Optional 默认值
-    # "all" 不生效——None 会落入下方合法性校验直接 INVALID_ARGUMENT。入口统一规范化，
+    # "all" 不生效——None 会落入下方合法性校验直接 INVALID_INPUT。入口统一规范化，
     # None/空串等价于不过滤（all），与缺省行为一致。
     status = status or "all"
     workflow_status = workflow_status or "all"
     _VALID_STATUS = {"all", "unacked", "acked"}
     _VALID_WORKFLOW = {"all", "unacked", "confirmed", "resolved", "closed"}
     if status not in _VALID_STATUS:
-        return {"ok": False, "error": "INVALID_ARGUMENT",
+        return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"status 必须是 {sorted(_VALID_STATUS)} 之一，收到：{status!r}"}
     if workflow_status not in _VALID_WORKFLOW:
-        return {"ok": False, "error": "INVALID_ARGUMENT",
+        return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"workflow_status 必须是 {sorted(_VALID_WORKFLOW)} 之一，收到：{workflow_status!r}"}
     items = [
         r for r in get_repository().all_notifications()
@@ -971,10 +971,10 @@ def get_notifications(patient_id: str,
     total = len(items)
     if page is not None:
         if isinstance(page, bool) or not isinstance(page, int) or page < 1:
-            return {"ok": False, "error": "INVALID_ARGUMENT",
+            return {"ok": False, "error": "INVALID_INPUT",
                     "detail": "page 必须为 ≥1 的整数"}
         if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
-            return {"ok": False, "error": "INVALID_ARGUMENT",
+            return {"ok": False, "error": "INVALID_INPUT",
                     "detail": "page_size 必须为 ≥1 的整数"}
         page_size = min(page_size, 200)
         start = (page - 1) * page_size
@@ -996,10 +996,9 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
     BUG-28 说明（2026-08-12）：ack 走**读权闸门（write=False）是有意的设计意图**——
     所有拥有 P3 读权的角色（含家长）都可标记自己患者的通知已读；ack 不产生新的
     业务状态、幂等、无 MX-3 收口需求，故仍按读操作闸门放行。
-    #10（2026-08-15）：ack_notification 已补登记 WRITE_TOOL_POLICY（家长写操作，
-    allowed={parent,doctor}，矩阵 care×parent 升 RW）——登记不改变 ack 的读闸
-    执行路径（_guard write=False 是准入语义，登记是登记完整性），此前的"不登记"
-    注释已过时，删。
+    A1-1（2026-08-16，十审）：WRITE_TOOL_POLICY 的 ack_notification 登记已删除——
+    该登记是装饰性的（本函数从不走 enforce_write），会让人误以为受 MX-3 写权收口；
+    真实强制 = 读闸门 + 家长 guardian_token 绑定（下方 :1029）。
     BUG-40（2026-08-12）：家长 ack 必须携带 guardian_token 且与该通知所属患者绑定
     （此前家长传任意 notification_id 可标记任意患者通知已读）。
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
@@ -1013,7 +1012,7 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
         # 此前未 strip（" abc " 查不到归 NOT_FOUND，语义误导）；None 穿透可能让
         # Tablestore 端用非法主键构造请求（JSON 端 store.get(None) 返回 None 掩盖）。
         if notification_id is None or not str(notification_id).strip():
-            return {"ok": False, "error": "INVALID_ARGUMENT",
+            return {"ok": False, "error": "INVALID_INPUT",
                     "detail": "notification_id 不能为空"}
         notification_id = str(notification_id).strip()
         rec = get_repository().load_notification(notification_id)
@@ -1024,7 +1023,7 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
         # 缺该键的记录此前直接 KeyError（server _invalid 归 INTERNAL_ERROR，掩盖脏数据）。
         _pid = rec.get("patient_id")
         if _pid is None:
-            return {"ok": False, "error": "INVALID_ARGUMENT",
+            return {"ok": False, "error": "INVALID_INPUT",
                     "detail": f"通知 {notification_id} 缺少 patient_id（脏数据），拒绝 ack"}
         denied = _guard_guardian(caller, _pid, guardian_token, "ack_notification")
         if denied:
@@ -1064,7 +1063,7 @@ def update_notification_status(notification_id: str, new_status: str,
     - workflow_status 严格一步流转：unacked → confirmed → resolved → closed（禁止跳级）。
     - BUG-46：escalated 是**独立布尔字段**（escalate_notification 设置），不在本状态机内——
       升级与 workflow_status 正交，通知可在 confirmed 下被升级，升级后仍为 confirmed。
-    - resolved 必须携带 resolution_note（BUG-09 修复，缺则返回 INVALID_ARGUMENT）。
+    - resolved 必须携带 resolution_note（BUG-09 修复，缺则返回 INVALID_INPUT）。
     - 与 ack_notification 解耦：ack 只置已读 status，本工具只推进 workflow_status（BUG-12）。
     """
     caller = get_caller()
@@ -1079,7 +1078,7 @@ def update_notification_status(notification_id: str, new_status: str,
     # 潜在 3（2026-08-14）：notification_id None 显式拒绝——此前 None.strip()
     # 抛 AttributeError 被 server _invalid 归 INTERNAL_ERROR（500 类），误导排障。
     if not notification_id or not str(notification_id).strip():
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": "notification_id 不能为空"}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": "notification_id 不能为空"}
     with _STORE_LOCK:
         nid = str(notification_id).strip()
         rec = get_repository().load_notification(nid)
@@ -1105,7 +1104,7 @@ def update_notification_status(notification_id: str, new_status: str,
                     "detail": f"workflow_status 不允许从 {current} 直接转到 {new_status}"
                               f"（严格一步流转，需求 §5.1）"}
         if new_status == "resolved" and not (resolution_note or "").strip():
-            return {"ok": False, "error": "INVALID_ARGUMENT",
+            return {"ok": False, "error": "INVALID_INPUT",
                     "detail": "resolved 必须携带 resolution_note（需求 §5.2）"}
         rec["workflow_status"] = new_status
         rec["status_updated_by"] = caller
@@ -1136,14 +1135,14 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
         return denied
     # 潜在 3（2026-08-14）：None 显式拒绝（对齐 update_notification_status）
     if not notification_id or not str(notification_id).strip():
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": "notification_id 不能为空"}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": "notification_id 不能为空"}
     with _STORE_LOCK:
         nid = str(notification_id).strip()
         rec = get_repository().load_notification(nid)
         if rec is None:
             return {"ok": False, "error": "NOT_FOUND", "detail": f"通知 {nid} 不存在"}
         if rec.get("workflow_status") == "closed":
-            return {"ok": False, "error": "INVALID_ARGUMENT",
+            return {"ok": False, "error": "INVALID_INPUT",
                     "detail": "已关闭工单不可再升级"}
         rec["escalated"] = True
         rec["escalated_by"] = caller

@@ -415,6 +415,37 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None) -> 
     }
 
 
+def _record_fingerprint(rec: dict[str, Any]) -> str:
+    """八审（2026-08-16，M6 补全）：随访记录**内容指纹**——去重键从
+    (visit_date, visit_type) 天粒度扩展为 (visit_date, visit_type, 内容指纹)。
+
+    天粒度去重的缺陷：同类型同日的两次**真实访视**（如上午+下午各一次
+    dialysis、两次 nutrition_counsel）会被误判 DUPLICATE 并强制"编辑覆盖"，
+    真实丢数据。现判定改为：同日同类型**且内容完全一致**（indicators_snapshot/
+    plan_summary/doctor_notes 相同）才视为真重试拒绝；内容不同即两次真实访视，
+    放行追加。序列化排序保证字典键序无关（同内容不同键序不算差异）。
+    """
+    return json.dumps({
+        "visit_type": rec.get("visit_type"),
+        "indicators_snapshot": rec.get("indicators_snapshot") or {},
+        "plan_summary": rec.get("plan_summary") or "",
+        "doctor_notes": rec.get("doctor_notes") or "",
+    }, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _check_snapshot_jsonable(indicators_snapshot: dict[str, Any]) -> None:
+    """八审（2026-08-16）：indicators_snapshot 内容须可 JSON 序列化——
+    此前只验 isinstance dict，dict 内嵌 NaN/Inf/non-serializable 对象会在
+    save_followup 的 json.dumps 处炸 INTERNAL_ERROR（且无明确入口提示）。
+    显式预检 + 明确 detail，fail-closed（不可序列化拒绝落库，防脏数据写盘）。
+    """
+    try:
+        json.dumps(indicators_snapshot, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"indicators_snapshot 含不可 JSON 序列化内容，拒绝落库（防脏数据写盘）: {exc}") from exc
+
+
 def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_stage: str,
                         indicators_snapshot: dict, plan_summary: str, doctor_notes: str = "") -> dict[str, Any]:
     """追加一条随访记录（写，仅临床角色；server.add_followup_record_tool 直接暴露）。
@@ -445,6 +476,14 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"ckd_stage 必须是 {'/'.join(_BASE_INTERVAL_DAYS)} 之一，"
                           f"收到 {ckd_stage!r}"}
+    # 八审（2026-08-16）：indicators_snapshot 内容可序列化预检（fail-closed，防脏数据写盘）
+    if indicators_snapshot is None or not isinstance(indicators_snapshot, dict):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": "indicators_snapshot 必须为 dict"}
+    try:
+        _check_snapshot_jsonable(indicators_snapshot)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
     rec = {
         "record_id": _short_id("FR", patient_id),
         "visit_date": visit_date,
@@ -468,12 +507,18 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
         # 重复行，get_followup_records 时间线出现双份同日记录）。
         # M3（2026-08-16）：幂等键加 **visit_type**——同日不同访视（如上午门诊 +
         # 下午营养门诊）此前被误判重复拒绝；同类型同日才是重试。
+        # 八审（2026-08-16，M6 补全）：幂等键再加**内容指纹**——(visit_date,
+        # visit_type) 天粒度仍会误伤**同类型同日的两次真实访视**（如两次 dialysis /
+        # 两次 nutrition_counsel）→ 强制编辑覆盖 = 真实丢数据。现内容完全一致
+        # （重试/误操作）才判 DUPLICATE，内容不同放行（两次真实访视）。
+        _fp_new = _record_fingerprint(rec)
         for existing in p.get("records") or []:
             if existing.get("visit_date") == visit_date \
-                    and existing.get("visit_type") == visit_type:
+                    and existing.get("visit_type") == visit_type \
+                    and _record_fingerprint(existing) == _fp_new:
                 return {"ok": False, "error": "DUPLICATE",
                         "detail": f"patient_id={patient_id} 在 {visit_date} "
-                                  f"（{visit_type}）已有随访记录"
+                                  f"（{visit_type}）已有内容完全一致的随访记录"
                                   f"（{existing.get('record_id')}），拒绝重复追加；"
                                   "如需修正请编辑已有记录"}
         p["records"].append(rec)

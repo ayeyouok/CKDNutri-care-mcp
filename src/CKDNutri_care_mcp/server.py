@@ -17,6 +17,8 @@ from fastmcp import FastMCP
 from a207_policy import translate_error
 
 from .core import (
+    _BASE_INTERVAL_DAYS,
+    _VISIT_TYPES,
     ack_notification,
     add_followup_record,
     build_event_notification,
@@ -52,6 +54,16 @@ NotificationStatus = Literal["all", "unacked", "acked"]
 WorkflowStatus = Literal["all", "unacked", "confirmed", "resolved", "closed"]
 NewWorkflowStatus = Literal["unacked", "confirmed", "resolved", "closed"]
 EventType = Literal["followup_due", "risk_escalation", "report_ready"]
+
+# 八审（2026-08-16）：三份枚举归一——server Literal（JSON Schema 提示）与 core
+# 运行时校验常量（_VISIT_TYPES / _BASE_INTERVAL_DAYS）必须一致；任一边漏改立即
+# 启动失败（fail-fast），杜绝"Schema 提示的合法值与 core 校验值分叉"重新引入脏数据。
+assert set(VisitType.__args__) == set(_VISIT_TYPES), (
+    f"VisitType Literal 与 core._VISIT_TYPES 漂移: "
+    f"{sorted(VisitType.__args__)} vs {sorted(_VISIT_TYPES)}")
+assert set(CKDStage.__args__) == set(_BASE_INTERVAL_DAYS), (
+    f"CKDStage Literal 与 core._BASE_INTERVAL_DAYS 漂移: "
+    f"{sorted(CKDStage.__args__)} vs {sorted(_BASE_INTERVAL_DAYS)}")
 
 # 凭据敏感键模式（子串匹配 + 大小写不敏感）——键名含任一模式即整体掩码
 # 2026-08-12（五审）：`auth` 简单子串会误杀 author/authority/authentic 等正常业务

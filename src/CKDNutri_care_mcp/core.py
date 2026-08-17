@@ -253,16 +253,26 @@ def _mask_notification(rec: dict, caller: str) -> dict:
     # 升级轨迹）。
     hist = out.get("escalated_history")
     if isinstance(hist, list):
+        # F5（2026-08-17，十二审）：元素非 dict（脏数据如字符串）时 h.items() 抛
+        # AttributeError 且不被 except 捕获 → 家长 get_notifications 整次读变
+        # INTERNAL_ERROR（可用性故障）。非 dict 元素原样保留（不剥 by 也不 crash），
+        # 脏数据不影响整次读取。
         out["escalated_history"] = [
-            {k2: v2 for k2, v2 in h.items() if k2 != "by"} for h in hist]
+            ({k2: v2 for k2, v2 in h.items() if k2 != "by"}
+             if isinstance(h, dict) else h) for h in hist]
     elif isinstance(hist, str):
         try:
             parsed = json.loads(hist)
             if isinstance(parsed, list):
                 out["escalated_history"] = [
-                    {k2: v2 for k2, v2 in h.items() if k2 != "by"} for h in parsed]
+                    ({k2: v2 for k2, v2 in h.items() if k2 != "by"}
+                     if isinstance(h, dict) else h) for h in parsed]
         except (json.JSONDecodeError, TypeError):
-            pass  # 脏数据：保留原样（剥除失败不 crash，父层已有 fail-closed 读取）
+            # F5/C 审计（2026-08-17）：JSON 损坏时**剥除整个字段**（fail-closed）——
+            # 此前 pass 保留原样，若损坏串含 by 即泄露医生身份（fail-open 方向）。
+            # 家长视角宁可少给不给漏；存储层读取已有 fail-closed 拦截（读时抛错），
+            # 此处兜底家长展示路径。
+            out.pop("escalated_history", None)
     return out
 
 

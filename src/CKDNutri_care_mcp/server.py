@@ -58,12 +58,16 @@ EventType = Literal["followup_due", "risk_escalation", "report_ready"]
 # 八审（2026-08-16）：三份枚举归一——server Literal（JSON Schema 提示）与 core
 # 运行时校验常量（_VISIT_TYPES / _BASE_INTERVAL_DAYS）必须一致；任一边漏改立即
 # 启动失败（fail-fast），杜绝"Schema 提示的合法值与 core 校验值分叉"重新引入脏数据。
-assert set(VisitType.__args__) == set(_VISIT_TYPES), (
-    f"VisitType Literal 与 core._VISIT_TYPES 漂移: "
-    f"{sorted(VisitType.__args__)} vs {sorted(_VISIT_TYPES)}")
-assert set(CKDStage.__args__) == set(_BASE_INTERVAL_DAYS), (
-    f"CKDStage Literal 与 core._BASE_INTERVAL_DAYS 漂移: "
-    f"{sorted(CKDStage.__args__)} vs {sorted(_BASE_INTERVAL_DAYS)}")
+# 技术债务 1（2026-08-18）：生产禁用 assert——python -O 会静默跳过，启动自检失效；
+# 改显式 raise RuntimeError（fail-fast 语义不变，-O 下仍生效）。
+if set(VisitType.__args__) != set(_VISIT_TYPES):
+    raise RuntimeError(
+        f"VisitType Literal 与 core._VISIT_TYPES 漂移: "
+        f"{sorted(VisitType.__args__)} vs {sorted(_VISIT_TYPES)}")
+if set(CKDStage.__args__) != set(_BASE_INTERVAL_DAYS):
+    raise RuntimeError(
+        f"CKDStage Literal 与 core._BASE_INTERVAL_DAYS 漂移: "
+        f"{sorted(CKDStage.__args__)} vs {sorted(_BASE_INTERVAL_DAYS)}")
 
 # 凭据敏感键模式（子串匹配 + 大小写不敏感）——键名含任一模式即整体掩码
 # 2026-08-12（五审）：`auth` 简单子串会误杀 author/authority/authentic 等正常业务

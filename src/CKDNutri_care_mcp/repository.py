@@ -107,6 +107,15 @@ class CareRepository(Protocol):
         """整体保存单条通知（并发安全同上）。"""
         ...
 
+    def save_notification_expect_not_exist(self, notification_id: str,
+                                           rec: dict[str, Any]) -> bool:
+        """条件插入（主键不存在才写入）：跨 Worker/进程去重的正确性保证。
+
+        返回 True=创建成功；False=主键已存在（同事件通知已被并发者创建），
+        不覆盖现有行。Tablestore 端 EXPECT_NOT_EXIST 条件写，JSON 端进程内锁查主键。
+        """
+        ...
+
     def all_notifications(self) -> list[dict[str, Any]]:
         """全量通知（供按 patient_id 过滤；Tablestore 用 GetRange）。"""
         ...
@@ -186,6 +195,19 @@ class LocalJsonRepository:
             store[notification_id] = {**store.get(notification_id, {}), **rec}
             atomic_write_json(_notification_json_path(), store)
 
+    def save_notification_expect_not_exist(self, notification_id: str,
+                                           rec: dict[str, Any]) -> bool:
+        # P0-1（2026-08-18）：条件插入（进程内锁查主键，模拟 Tablestore 端
+        # EXPECT_NOT_EXIST）——跨 Worker 并发创建同事件通知时，主键已存在即拒绝，
+        # 不覆盖、不静默重复（JSON 后端单进程部署，进程内锁即正确性保证）。
+        with _FILE_LOCK:
+            store = _read_json_file(_notification_json_path(), "通知库")
+            if notification_id in store:
+                return False
+            store[notification_id] = dict(rec)
+            atomic_write_json(_notification_json_path(), store)
+            return True
+
     def all_notifications(self) -> list[dict[str, Any]]:
         store = _read_json_file(_notification_json_path(), "通知库")
         return [r for r in store.values() if isinstance(r, dict)]
@@ -225,7 +247,13 @@ class TablestoreRepository(TablestoreBase):
         out: dict[str, Any] = {}
         for key in ("records", "plans", "adherence"):
             raw = attrs.get(key)
-            if isinstance(raw, str):
+            # P2-2（2026-08-18）：缺失（None，列不存在/新行）→ 空列表（合法默认）；
+            # 错误类型（dict/int/bool 等非 str 非 list）→ **抛错 fail-closed**——
+            # 此前一律静默兜底 []，损坏但可解析的行被当空库读取，后续 save 全量
+            # 覆盖会把真实数据冲掉（无声数据丢失，与 JSON 端损坏口径相悖）。
+            if raw is None:
+                out[key] = []
+            elif isinstance(raw, str):
                 try:
                     out[key] = json.loads(raw)
                 except json.JSONDecodeError as exc:
@@ -239,7 +267,9 @@ class TablestoreRepository(TablestoreBase):
             elif isinstance(raw, list):
                 out[key] = raw
             else:
-                out[key] = []
+                raise RuntimeError(
+                    f"随访数据列 {key} 类型错误：期望 JSON 字符串或 list，"
+                    f"实际为 {type(raw).__name__}，拒绝静默降级为空列表")
         return out
 
     @staticmethod
@@ -290,6 +320,22 @@ class TablestoreRepository(TablestoreBase):
         attrs = self._serialize_notification(rec)
         self._save_row_locked(
             TABLE_NOTIFICATION, self._pk_nid(notification_id), attrs)
+
+    def save_notification_expect_not_exist(self, notification_id: str,
+                                           rec: dict[str, Any]) -> bool:
+        # P0-1（2026-08-18）：条件插入（EXPECT_NOT_EXIST）——跨 Worker/多进程并发
+        # 创建同事件通知的唯一幂等保证：确定性事件主键已存在 → SDK 抛 OTSClientError
+        # → 返回 False（不覆盖现有行，防重复入队）。乐观锁 _save_row_locked 只护
+        # "已有主键"的更新，对新建行无条件放行，无法拦并发重复插入。
+        from tablestore import OTSClientError
+
+        attrs = self._serialize_notification(rec)
+        try:
+            self._put_row_not_exist(
+                TABLE_NOTIFICATION, self._pk_nid(notification_id), attrs)
+            return True
+        except OTSClientError:
+            return False  # 主键已存在（同事件通知已创建）→ 幂等去重命中
 
     def all_notifications(self) -> list[dict[str, Any]]:
         rows = self._range_all(TABLE_NOTIFICATION, ["notification_id"])

@@ -109,3 +109,67 @@ def test_d1_parent_notification_masked():
     assert "resolution_note" in full and "escalated_by" in full, "医生视角应保留"
     # 幂等：家长裁剪后再次裁剪无变化
     assert _mask_notification(masked, "parent_assistant") == masked
+
+
+def test_p01_event_notification_idempotent_dedup():
+    """P0-1（2026-08-18）：事件驱动通知确定性主键 + 条件插入——跨 Worker 并发
+    创建同事件（同 patient/category/source_event/due_at）只落一行，重复创建
+    DUPLICATE；不同 due_at（重排）生成不同主键放行；手动通知（无 source_event）
+    维持随机 id 不幂等。"""
+    import tempfile
+
+    from CKDNutri_care_mcp import core
+
+    # 隔离：JSON 后端持久化会让确定性主键在重复 pytest 运行间残留（第二次运行
+    # 首次创建即撞 DUPLICATE，测试不幂等）——通知库指到独立临时目录。
+    os.environ["A207_NOTIFICATION_DATA_DIR"] = tempfile.mkdtemp(prefix="a207-care-test-")
+
+    # 同事件同 due_at 两次创建：第一次成功、第二次 DUPLICATE，且 id 确定性一致
+    a = core.create_notification("P0001", "followup_due", "high", "随访到期",
+                                 "请及时预约", due_at="2026-09-01",
+                                 source_event="followup_due#2026-09-01")
+    assert a["ok"] is True, a
+    nid = a["data"]["notification"]["id"]
+    b = core.create_notification("P0001", "followup_due", "high", "随访到期",
+                                 "请及时预约", due_at="2026-09-01",
+                                 source_event="followup_due#2026-09-01")
+    assert b["ok"] is False and b["error"] == "DUPLICATE", b
+    # 重排（due_at 变化）→ 新主键，放行
+    c = core.create_notification("P0001", "followup_due", "high", "随访到期",
+                                 "请及时预约", due_at="2026-09-15",
+                                 source_event="followup_due#2026-09-01")
+    assert c["ok"] is True, c
+    assert c["data"]["notification"]["id"] != nid, "due_at 变化应生成新主键"
+    # 手动通知（无 source_event）→ 随机 id，两次创建均成功（不幂等）
+    m1 = core.create_notification("P0001", "report_ready", "medium", "报告", "b")
+    m2 = core.create_notification("P0001", "report_ready", "medium", "报告", "b")
+    assert m1["ok"] is True and m2["ok"] is True, (m1, m2)
+    assert m1["data"]["notification"]["id"] != m2["data"]["notification"]["id"]
+
+
+def test_p01_pew_utc_normalize():
+    """P0-2（2026-08-18）：_parse_pew_date 对带时区 ISO 串归一化到 UTC——
+    '2024-01-10T08:30:00+08:00'（=UTC 00:30）与 '2024-01-10T00:30:00Z' 解析结果
+    必须相等，跨时区时间线排序不颠倒。"""
+    from CKDNutri_care_mcp.core import _parse_pew_date
+
+    d1 = _parse_pew_date("2024-01-10T08:30:00+08:00")
+    d2 = _parse_pew_date("2024-01-10T00:30:00Z")
+    assert d1 == d2, (d1, d2)
+    assert d1.tzinfo is None, "应返回 naive（UTC 归一化后剥时区）"
+    # naive 输入（无时区语义）原样返回墙钟时间，不做位移——断言墙钟与 tzinfo
+    from datetime import datetime
+
+    d3 = _parse_pew_date("2024-01-10T08:30:00")
+    assert d3 == datetime(2024, 1, 10, 8, 30) and d3.tzinfo is None, d3
+
+
+def test_p21_adherence_ratio_type_guard():
+    """P2-1（2026-08-18）：calc_adherence_score 比率类型保护——bool（True 可过
+    0<=x<=1）与字符串（比较 TypeError）一律 INVALID_INPUT 信封，不 500。"""
+    from CKDNutri_care_mcp import core
+
+    assert core.calc_adherence_score(True, 0.5, 0.5)["ok"] is False
+    r = core.calc_adherence_score("0.5", 0.5, 0.5)
+    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
+    assert core.calc_adherence_score(0.8, 0.7, 0.9)["ok"] is True

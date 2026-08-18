@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -431,9 +432,19 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None,
     denied = _guard_guardian(caller, patient_id, guardian_token, "get_followup_records")
     if denied:
         return denied
-    if limit is not None and (limit < 0 or offset < 0):
-        return {"ok": False, "error": "INVALID_INPUT",
-                "detail": "limit/offset 不能为负"}
+    # P2-1（2026-08-18）：limit/offset **类型 + 范围**校验——此前 `limit < 0 or
+    # offset < 0` 在传字符串（"100"）时 TypeError→500（server 归 INTERNAL_ERROR），
+    # 传 bool（True）被 int 比较放行；且 offset 仅在 limit 非空时校验。统一：
+    # int（非 bool）且非负；limit 允许 None（全量），offset 必须整数。
+    for _name, _v in (("limit", limit), ("offset", offset)):
+        if _v is None:
+            continue
+        if isinstance(_v, bool) or not isinstance(_v, int):
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"{_name} 必须为整数（不含 bool），收到：{_v!r}"}
+        if _v < 0:
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"{_name} 不能为负，收到：{_v!r}"}
     p = get_repository().load_followup(patient_id)
     if not p:
         return {"ok": True, "data": {
@@ -600,8 +611,17 @@ def calc_adherence_score(diet_ratio: float, med_ratio: float, visit_ratio: float
     （pubmed 24814533 综述：单一工具不充分，应多方法组合）。故本复合分为**系统定义、待临床验证**，
     默认等权（1/3 各），可通过 weights 调整。
     """
-    if not (0.0 <= diet_ratio <= 1.0 and 0.0 <= med_ratio <= 1.0 and 0.0 <= visit_ratio <= 1.0):
-        return {"ok": False, "error": "INVALID_INPUT", "detail": "各比率须在 0-1 之间"}
+    # P2-1（2026-08-18）：三个域比率**类型保护**——此前 `0.0 <= ratio <= 1.0` 对
+    # bool（True=1）放行（bool 是 int 子类，0.0 <= True <= 1.0 成立）、对字符串
+    # 比较抛 TypeError（core 被编排层直调时 500 类崩溃，非契约错误信封）。与
+    # weights 元素校验（下方）同口径：int/float、非 bool、有限、非负、≤1。
+    for _name, _r in (("diet_ratio", diet_ratio), ("med_ratio", med_ratio),
+                      ("visit_ratio", visit_ratio)):
+        if not (isinstance(_r, (int, float)) and not isinstance(_r, bool)
+                and math.isfinite(_r) and 0.0 <= _r <= 1.0):
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"{_name} 必须为 0-1 之间的有限数值（int/float，"
+                              f"不含 bool/NaN/Inf/字符串），收到：{_r!r}"}
     # BUG-65（2026-08-12）：weights 必须恰为 3 元素——此前仅校验和=1，传 (0.5, 0.5) 时
     # 和=1.0 通过校验但下方 weights[2] 抛 IndexError（未捕获崩溃）。
     if len(weights) != 3:
@@ -727,7 +747,13 @@ def _parse_pew_date(value: Any) -> Optional[datetime]:
             dt = datetime.fromisoformat(raw.replace("/", "-").replace(".", "-"))
         except ValueError:
             return None
-    return dt.replace(tzinfo=None)
+    # P0-2（2026-08-18）：带时区的 aware datetime 必须先归一化到 UTC 再剥时区——
+    # 此前直接 dt.replace(tzinfo=None) 保留**墙钟时间**（如 2024-01-10T08:30:00+08:00
+    # → 08:30），与同刻的 2024-01-10T00:30:00Z（→ 00:30）排序颠倒，跨时区时间线
+    # 顺序错乱。aware → astimezone(UTC) 后去时区；naive（无时区语义）原样返回。
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
@@ -893,7 +919,18 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
                             "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
                                       f"已有未关闭通知 {existing.get('id')}，拒绝重复创建；"
                                       "可对该通知执行 ack/escalate 处理"}
-        nid = "N" + uuid.uuid4().hex[:12].upper()
+        # P0-1（2026-08-18）：**事件驱动通知用确定性幂等主键**（不再随机 uuid）——
+        # 主键 = sha1(patient|category|source_event|due_at)。跨 Worker/多进程并发创建
+        # 同事件通知时，repository 的 EXPECT_NOT_EXIST 条件插入（Tablestore）/锁内查
+        # 主键（JSON）保证只落一行：先到者成功、后到者 DUPLICATE。此前靠内存锁
+        # _STORE_LOCK + 全表扫描"先查后插"，多进程部署两台 Worker 同时查无记录 →
+        # 各插一条，去重失效。手动通知（无 source_event）维持随机 id（临床主动
+        # 行为不幂等，同既有语义）。
+        if source_event:
+            id_key = (f"{patient_id}|{category}|{str(source_event).strip()}|{due_at or ''}")
+            nid = "N" + hashlib.sha1(id_key.encode("utf-8")).hexdigest()[:12].upper()
+        else:
+            nid = "N" + uuid.uuid4().hex[:12].upper()
         rec = {
             "id": nid,
             "patient_id": patient_id,
@@ -913,7 +950,15 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
             "status_updated_by": None,
             "status_updated_at": None,
         }
-        get_repository().save_notification(nid, rec)
+        if source_event:
+            # P0-1：条件插入（跨进程幂等）——主键已存在（并发者已创建同事件通知）
+            # → DUPLICATE，不覆盖、不重复入队。
+            if not get_repository().save_notification_expect_not_exist(nid, rec):
+                return {"ok": False, "error": "DUPLICATE",
+                        "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
+                                  f"已被并发创建（通知 {nid}），拒绝重复入队"}
+        else:
+            get_repository().save_notification(nid, rec)
     return {"ok": True, "data": {"notification": rec}}
 
 
@@ -942,6 +987,29 @@ def build_event_notification(event_type: str, patient_id: str, payload: dict[str
     tpl = _EVENT_TEMPLATES.get(event_type)
     if tpl is None:
         return {"ok": False, "error": "INVALID_EVENT", "detail": f"未知事件类型: {event_type}"}
+    # P2-3（2026-08-18）：payload 类型 + **字段级 Schema 校验**——此前仅靠模板
+    # .format 兜底：next_due_date=None 被静默填充为 "None"、垃圾串原样进正文
+    # （畸形值不报错只出脏文案，fail-open）。按事件类型校验必填字段类型/格式；
+    # 非 dict payload 显式 INVALID_PAYLOAD（此前 dict(None) 抛 TypeError→500）。
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "INVALID_PAYLOAD",
+                "detail": f"payload 必须为对象，收到：{type(payload).__name__}"}
+    if event_type == "followup_due":
+        _ndd = payload.get("next_due_date")
+        if not isinstance(_ndd, str) or not _ndd.strip():
+            return {"ok": False, "error": "INVALID_PAYLOAD",
+                    "detail": "followup_due 事件必须提供 next_due_date（YYYY-MM-DD）"}
+        try:
+            date.fromisoformat(_ndd.strip())
+        except ValueError:
+            return {"ok": False, "error": "INVALID_PAYLOAD",
+                    "detail": f"next_due_date 必须为 YYYY-MM-DD 日期，收到：{_ndd!r}"}
+    elif event_type == "risk_escalation":
+        for _f in ("from_level", "to_level", "rule"):
+            _v = payload.get(_f)
+            if not isinstance(_v, str) or not _v.strip():
+                return {"ok": False, "error": "INVALID_PAYLOAD",
+                        "detail": f"risk_escalation 事件必须提供非空字符串字段 {_f}"}
     try:
         # BUG-65（2026-08-12）：payload 可能含 patient_id 键（编排层常见）——直接
         # .format(patient_id=patient_id, **payload) 会抛 TypeError: got multiple values
@@ -1144,6 +1212,11 @@ def update_notification_status(notification_id: str, new_status: str,
     # 抛 AttributeError 被 server _invalid 归 INTERNAL_ERROR（500 类），误导排障。
     if not notification_id or not str(notification_id).strip():
         return {"ok": False, "error": "INVALID_INPUT", "detail": "notification_id 不能为空"}
+    # P2-1（2026-08-18）：resolution_note 类型保护——此前对 int/None 走
+    # `(resolution_note or "").strip()` 抛 AttributeError→500（INTERNAL_ERROR）。
+    if not isinstance(resolution_note, str):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"resolution_note 必须为字符串，收到：{resolution_note!r}"}
     with _STORE_LOCK:
         nid = str(notification_id).strip()
         rec = get_repository().load_notification(nid)
@@ -1201,6 +1274,11 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
     # 潜在 3（2026-08-14）：None 显式拒绝（对齐 update_notification_status）
     if not notification_id or not str(notification_id).strip():
         return {"ok": False, "error": "INVALID_INPUT", "detail": "notification_id 不能为空"}
+    # P2-1（2026-08-18）：reason 类型保护——此前对 int/None 走 reason.strip() 抛
+    # AttributeError→500（INTERNAL_ERROR），与 resolution_note 同口径。
+    if not isinstance(reason, str):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"reason 必须为字符串，收到：{reason!r}"}
     with _STORE_LOCK:
         nid = str(notification_id).strip()
         rec = get_repository().load_notification(nid)

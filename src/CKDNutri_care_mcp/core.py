@@ -201,6 +201,32 @@ def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def _canonicalize_due(due_at: Any) -> str:
+    """P0 衍生 2（2026-08-18）：due_at **规范化**（去重键/确定性主键 hash 用）。
+
+    同一时刻的不同字面表示（如 2026-08-20T00:00:00Z 与 2026-08-20T08:00:00+08:00）
+    此前字面不同 → 去重失效、同事件生成两条通知。规则：
+    - YYYY-MM-DD 日期 → 原样；
+    - datetime aware → astimezone(UTC) 后 ISO 秒级（跨时区同刻 → 同串）；
+    - datetime naive → ISO 秒级（无时区语义，不位移）。
+    仅用于键计算；落库展示值 rec["due_at"] 保持调用方原样。
+    """
+    raw = str(due_at or "").strip()
+    if not raw:
+        return ""
+    try:
+        return date.fromisoformat(raw).isoformat()
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return raw  # 入口 create_notification 已校验（理论不可达），防御性原样
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(timespec="seconds")
+
+
 def _require_iso_date(value: Any, field: str = "visit_date",
                       allow_future: bool = True) -> str:
     """校验日期串为 YYYY-MM-DD 并返回规范化值（C/D，2026-08-12 三审）。
@@ -904,7 +930,11 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
             # （如 followup_due 事件类型固定映射）但**新的到期日**应视为"新一次提醒"，
             # 旧去重键不含 due_at 会把重排后的新提醒当重复阻断（家长收不到新 followup_due）。
             # 含 due_at 后：同事件同到期日仍去重（防 HAIP 重试刷屏），到期日变化放行。
-            dup_key = (category, str(source_event).strip(), due_at or "")
+            # P0 衍生 2（2026-08-18）：due_at **规范化**后进键——同一时刻的不同字面
+            # （2026-08-20T00:00:00Z vs 2026-08-20T08:00:00+08:00）此前字面不同致
+            # 去重失效生成两条；规范化后同刻同键。
+            canon_due = _canonicalize_due(due_at)
+            dup_key = (category, str(source_event).strip(), canon_due)
             # H3（2026-08-16，第七轮审查）：confirmed 也应拦——此前
             # not in ("closed", "confirmed") 把已确认通知排除在去重外，
             # 编排/HAIP 对同事件重试会再创建重复通知（架空去重，疑似笔误）。
@@ -913,22 +943,24 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
             for existing in get_repository().all_notifications():
                 if existing.get("patient_id") == patient_id \
                         and (existing.get("category"), existing.get("source_event") or "",
-                             existing.get("due_at") or "") == dup_key \
+                             _canonicalize_due(existing.get("due_at"))) == dup_key \
                         and existing.get("workflow_status") not in ("closed",):
                     return {"ok": False, "error": "DUPLICATE",
                             "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
                                       f"已有未关闭通知 {existing.get('id')}，拒绝重复创建；"
                                       "可对该通知执行 ack/escalate 处理"}
         # P0-1（2026-08-18）：**事件驱动通知用确定性幂等主键**（不再随机 uuid）——
-        # 主键 = sha1(patient|category|source_event|due_at)。跨 Worker/多进程并发创建
-        # 同事件通知时，repository 的 EXPECT_NOT_EXIST 条件插入（Tablestore）/锁内查
-        # 主键（JSON）保证只落一行：先到者成功、后到者 DUPLICATE。此前靠内存锁
-        # _STORE_LOCK + 全表扫描"先查后插"，多进程部署两台 Worker 同时查无记录 →
-        # 各插一条，去重失效。手动通知（无 source_event）维持随机 id（临床主动
-        # 行为不幂等，同既有语义）。
+        # 主键 = sha1(patient|category|source_event|规范化 due_at)。跨 Worker/多进程
+        # 并发创建同事件通知时，repository 的 EXPECT_NOT_EXIST 条件插入（Tablestore）/
+        # 锁内查主键（JSON）保证只落一行：先到者成功、后到者 DUPLICATE。手动通知
+        # （无 source_event）维持随机 id（临床主动行为不幂等，同既有语义）。
+        # P0 衍生 3（2026-08-18）：主键 hash 由 12 hex（48-bit）扩至 **24 hex（96-bit）**
+        # ——千万级数据量下 48-bit Birthday Collision 会撞号、新事件被误判 DUPLICATE
+        # 静默丢通知；96-bit 在亿级下碰撞概率可忽略。
         if source_event:
-            id_key = (f"{patient_id}|{category}|{str(source_event).strip()}|{due_at or ''}")
-            nid = "N" + hashlib.sha1(id_key.encode("utf-8")).hexdigest()[:12].upper()
+            id_key = (f"{patient_id}|{category}|{str(source_event).strip()}|{canon_due}")
+            id_base = hashlib.sha1(id_key.encode("utf-8")).hexdigest()[:24].upper()
+            nid = "N" + id_base
         else:
             nid = "N" + uuid.uuid4().hex[:12].upper()
         rec = {
@@ -951,12 +983,23 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
             "status_updated_at": None,
         }
         if source_event:
-            # P0-1：条件插入（跨进程幂等）——主键已存在（并发者已创建同事件通知）
-            # → DUPLICATE，不覆盖、不重复入队。
+            # P0-1：条件插入（跨进程幂等）——主键已存在 → 未关闭 = 并发/重复 → DUPLICATE；
+            # **closed（终态）→ 重开新实例**（既有语义"仅 closed 放行，可重新开事件"，
+            # 见上 H3 注释）——确定性主键与 closed 重开冲突，重开时生成 -R<随机> 实例
+            # 主键放行（重开是人工操作路径，无需确定性；并发重试仍由条件插入拦截）。
             if not get_repository().save_notification_expect_not_exist(nid, rec):
-                return {"ok": False, "error": "DUPLICATE",
-                        "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
-                                  f"已被并发创建（通知 {nid}），拒绝重复入队"}
+                existing = get_repository().load_notification(nid)
+                if existing is not None and existing.get("workflow_status") == "closed":
+                    reopen_id = "N" + id_base + "-R" + uuid.uuid4().hex[:6].upper()
+                    rec["id"] = reopen_id
+                    if not get_repository().save_notification_expect_not_exist(reopen_id, rec):
+                        return {"ok": False, "error": "DUPLICATE",
+                                "detail": f"该事件重开实例并发冲突（{category}/{source_event}"
+                                          f"/due {due_at or '无'}，通知 {reopen_id}），请重试"}
+                else:
+                    return {"ok": False, "error": "DUPLICATE",
+                            "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
+                                      f"已被并发创建（通知 {nid}），拒绝重复入队"}
         else:
             get_repository().save_notification(nid, rec)
     return {"ok": True, "data": {"notification": rec}}
@@ -1299,15 +1342,25 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
         if reason.strip():
             entry["reason"] = reason.strip()
         raw_hist = rec.get("escalated_history")
-        if isinstance(raw_hist, str):
+        if raw_hist is None:
+            history = []  # 缺失（首次升级）→ 空列表合法
+        elif isinstance(raw_hist, str):
             try:
                 history = json.loads(raw_hist)
-            except (json.JSONDecodeError, TypeError):
-                history = []
+            except (json.JSONDecodeError, TypeError) as exc:
+                # 问题 4（2026-08-18）：解析失败 **fail-closed 拒绝覆盖**——此前捕获后
+                # history=[] 再追加覆盖写，损坏的升级审计历史被静默清空（审计丢失且
+                # 无告警）。抛 RuntimeError 归 INTERNAL_ERROR，交由运维修复存储行。
+                raise RuntimeError(
+                    f"通知 {nid} 的 escalated_history 损坏（非法 JSON）：拒绝覆盖审计"
+                    f"历史，请人工修复存储数据") from exc
         elif isinstance(raw_hist, list):
             history = list(raw_hist)
         else:
-            history = []
+            # 错误类型（dict/int 等）同样 fail-closed，不静默当空
+            raise RuntimeError(
+                f"通知 {nid} 的 escalated_history 类型错误：期望 JSON 字符串或 list，"
+                f"实际为 {type(raw_hist).__name__}，拒绝覆盖审计历史")
         history.append(entry)
         rec["escalated_history"] = history
         # C-S1 修复（2026-08-14）：只传**变更字段子集**——此前传完整 rec 快照

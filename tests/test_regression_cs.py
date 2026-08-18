@@ -173,3 +173,68 @@ def test_p21_adherence_ratio_type_guard():
     r = core.calc_adherence_score("0.5", 0.5, 0.5)
     assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
     assert core.calc_adherence_score(0.8, 0.7, 0.9)["ok"] is True
+
+
+def test_reopen_after_closed_same_event():
+    """P0-1 衍生（2026-08-18）：确定性主键与 closed 重开语义冲突修复——事件闭环
+    （closed 终态）后，同事件同 due_at 重新创建必须成功（新实例主键 -R<id>），
+    不被 EXPECT_NOT_EXIST 误判 DUPLICATE 阻塞。"""
+    import tempfile
+
+    from CKDNutri_care_mcp import core
+
+    os.environ["A207_NOTIFICATION_DATA_DIR"] = tempfile.mkdtemp(prefix="a207-care-test-")
+    ev = "reopen#2026-10-01"
+    a = core.create_notification("P0001", "followup_due", "high", "随访到期",
+                                 "正文", due_at="2026-10-01", source_event=ev)
+    assert a["ok"] is True, a
+    nid = a["data"]["notification"]["id"]
+    # 走到 closed 终态（unacked→confirmed→resolved→closed）
+    assert core.update_notification_status(nid, "confirmed")["ok"] is True
+    assert core.update_notification_status(nid, "resolved", "已处置")["ok"] is True
+    assert core.update_notification_status(nid, "closed")["ok"] is True
+    # 同事件同 due_at 重开 → 成功，新实例 id 不同（-R 后缀）
+    b = core.create_notification("P0001", "followup_due", "high", "随访到期",
+                                 "正文", due_at="2026-10-01", source_event=ev)
+    assert b["ok"] is True, b
+    assert b["data"]["notification"]["id"] != nid, "closed 后重开应生成新实例"
+
+
+def test_due_at_canonical_dedup():
+    """P0 衍生 2（2026-08-18）：due_at 规范化去重——同一时刻的不同字面
+    （2026-08-20T00:00:00Z vs 2026-08-20T08:00:00+08:00）必须命中同一去重键，
+    第二次创建 DUPLICATE（不再生成两条重复通知）。"""
+    import tempfile
+
+    from CKDNutri_care_mcp import core
+
+    os.environ["A207_NOTIFICATION_DATA_DIR"] = tempfile.mkdtemp(prefix="a207-care-test-")
+    ev = "canon#due"
+    a = core.create_notification("P0001", "followup_due", "high", "t", "b",
+                                 due_at="2026-08-20T00:00:00Z", source_event=ev)
+    assert a["ok"] is True, a
+    b = core.create_notification("P0001", "followup_due", "high", "t", "b",
+                                 due_at="2026-08-20T08:00:00+08:00", source_event=ev)
+    assert b["ok"] is False and b["error"] == "DUPLICATE", b
+
+
+def test_escalated_history_corrupt_fail_closed():
+    """问题 4（2026-08-18）：escalated_history 损坏（非法 JSON）时 escalate 必须
+    抛 RuntimeError（拒绝覆盖审计历史），不再静默置 [] 覆盖写。"""
+    import tempfile
+
+    from CKDNutri_care_mcp import core
+    from CKDNutri_care_mcp.repository import get_repository
+
+    os.environ["A207_NOTIFICATION_DATA_DIR"] = tempfile.mkdtemp(prefix="a207-care-test-")
+    n = core.create_notification("P0001", "followup_due", "medium", "t", "b")
+    nid = n["data"]["notification"]["id"]
+    # 直接写坏 escalated_history（JSON 字符串损坏）
+    repo = get_repository()
+    repo.save_notification(nid, {"escalated_history": "{broken json"})
+    try:
+        core.escalate_notification(nid, "升级理由")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("损坏的 escalated_history 未被 fail-closed 拒绝")

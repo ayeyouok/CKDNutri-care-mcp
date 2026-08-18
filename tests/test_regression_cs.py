@@ -238,3 +238,54 @@ def test_escalated_history_corrupt_fail_closed():
         pass
     else:
         raise AssertionError("损坏的 escalated_history 未被 fail-closed 拒绝")
+
+
+# ---- 十七审（2026-08-18）：P1-3 文本长度限制 / P2-4 PEW 峰值 / P2-5 日志脱敏 ----
+
+
+def test_p13_text_length_limits():
+    """P1-3：title/body/plan_summary/doctor_notes/resolution_note 超限拒绝（LLM 防护）。"""
+    from CKDNutri_care_mcp import core
+
+    r = core.create_notification("P0010", "risk_alert", "high",
+                                 "t" * 201, "body")
+    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
+    r = core.create_notification("P0010", "risk_alert", "high",
+                                 "title", "b" * 2001)
+    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
+    assert core.create_notification("P0010", "risk_alert", "high",
+                                    "title", "body")["ok"] is True
+
+    r = core.schedule_followup("P0010", "CKD4", "A2", "outpatient",
+                               "2026-09-15", plan_summary="x" * 2001)
+    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
+
+    r = core.add_followup_record("P0010", "2026-08-18", "outpatient",
+                                 "CKD4", {}, "", doctor_notes="n" * 5001)
+    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
+
+
+def test_p24_pew_peak_risk():
+    """P2-4：low→high→low 首末同档 trend=stable 但 peak_risk 必须报 high（漏报修复）。"""
+    from CKDNutri_care_mcp import core
+
+    r = core.get_pew_timeline("P0010", pew_history=[
+        {"date": "2026-08-01", "level": "low"},
+        {"date": "2026-08-10", "level": "high"},
+        {"date": "2026-08-18", "level": "low"},
+    ])
+    assert r["ok"] is True, r
+    d = r["data"]
+    assert d["trend"] == "stable", d          # 首末 low==low
+    assert d["peak_risk"] == "high", d        # 中间峰值不丢
+    assert d["recent_trend"] == "improving", d  # 最近两点 high→low
+
+
+def test_p25_mask_pk():
+    """P2-5：a207_policy.storage._mask_pk 掩码明文主键（患者 id 不落日志）。"""
+    from a207_policy.storage import _mask_pk
+
+    assert _mask_pk([("patient_id", "P0010")]) == "patient_id=P001***"
+    assert _mask_pk([("patient_id", "P0010"), ("sample_id", "P0010-Sabc1234")]) == \
+        "patient_id=P001***,sample_id=P001***"
+    assert "P0010" not in _mask_pk([("patient_id", "P0010")])

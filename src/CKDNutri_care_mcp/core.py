@@ -395,6 +395,12 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
     if not rec["ok"]:
         return rec
     interval = rec["data"]["recommended_interval_days"]
+    # P1-3（2026-08-18）：plan_summary/note_to_clinician 长度上限（LLM 防护）。
+    for _f, _v, _max in (("plan_summary", plan_summary, 2000),
+                         ("note_to_clinician", note_to_clinician, 5000)):
+        _r = _check_text_len(_v, _f, _max)
+        if _r is not None:
+            return _r
     plan = {
         "plan_id": _short_id("FP", patient_id),
         "cadence": {
@@ -569,6 +575,12 @@ def add_followup_record(patient_id: str, visit_date: str, visit_type: str, ckd_s
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"ckd_stage 必须是 {'/'.join(_BASE_INTERVAL_DAYS)} 之一，"
                           f"收到 {ckd_stage!r}"}
+    # P1-3（2026-08-18）：doctor_notes/plan_summary 长度上限（LLM 防护）。
+    for _f, _v, _max in (("doctor_notes", doctor_notes, 5000),
+                         ("plan_summary", plan_summary, 2000)):
+        _r = _check_text_len(_v, _f, _max)
+        if _r is not None:
+            return _r
     # 八审（2026-08-16）：indicators_snapshot 内容可序列化预检（fail-closed，防脏数据写盘）
     if indicators_snapshot is None or not isinstance(indicators_snapshot, dict):
         return {"ok": False, "error": "INVALID_INPUT",
@@ -748,6 +760,20 @@ def get_adherence_score(patient_id: str, diet_ratio: float, med_ratio: float, vi
 _PEW_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
+def _check_text_len(value: str, field: str, max_len: int) -> dict | None:
+    """文本长度上限校验（P1-3，2026-08-18：LLM 防护——超长 Payload/异常输出不拖垮系统）。
+
+    超限/非字符串 → INVALID_INPUT 信封（fail-closed）；合法返回 None（调用方继续）。
+    """
+    if not isinstance(value, str):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"{field} 必须为字符串，收到：{value!r}"}
+    if len(value) > max_len:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"{field} 超长：{len(value)} 字符（上限 {max_len}）"}
+    return None
+
+
 def _parse_pew_date(value: Any) -> Optional[datetime]:
     """解析 PEW 历史日期为 datetime；无效/缺失返回 None（BUG-67，对齐 content 包）。
 
@@ -841,10 +867,24 @@ def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
         dated.append((dt, p))
     dated.sort(key=lambda x: x[0])  # BUG-67：按解析后日期升序（points/趋势同口径）
     pts = [p for _, p in dated]
+    trend = "no_data"
+    peak_risk = "low"
+    recent_trend = "no_data"
     if len(pts) >= 2:
-        fo = _PEW_ORDER[str(pts[0].get("level", "low")).strip().lower()]
-        lo = _PEW_ORDER[str(pts[-1].get("level", "low")).strip().lower()]
+        levels = [_PEW_ORDER[str(p.get("level", "low")).strip().lower()] for p in pts]
+        fo, lo = levels[0], levels[-1]
         trend = "worsening" if lo > fo else "improving" if lo < fo else "stable"
+        # P2-4（2026-08-18）：峰值风险维度——仅比首末会漏报中间高危段
+        # （low→high→low 首末同档被判 stable，历史高危被掩盖）。peak_risk = 全程
+        # 最高等级；recent_trend = 最近两点走向（近期趋势，与整体首末区分）。
+        peak = max(levels)
+        peak_risk = next(k for k, v in _PEW_ORDER.items() if v == peak)
+        ro = levels[-2]
+        recent_trend = "worsening" if lo > ro else "improving" if lo < ro else "stable"
+    elif len(pts) == 1:
+        _lvl = _PEW_ORDER[str(pts[0].get("level", "low")).strip().lower()]
+        peak_risk = next(k for k, v in _PEW_ORDER.items() if v == _lvl)
+        recent_trend = "stable"
     return {
         "ok": True,
         "data": {
@@ -857,7 +897,10 @@ def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
             "count": len(pts),
             "points": pts,
             "trend": trend,
-            "note": "PEW 历史点按日期升序排列；趋势基于首末有效点的严重度对比。",
+            "peak_risk": peak_risk,
+            "recent_trend": recent_trend,
+            "note": "PEW 历史点按日期升序排列；trend 基于首末对比，peak_risk 为全程"
+                    "最高等级，recent_trend 为最近两点走向。",
         },
     }
 
@@ -896,6 +939,12 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"category 必须是 followup_due / risk_alert / report_ready，"
                           f"收到：{category!r}"}
+    # P1-3（2026-08-18）：title/body 长度上限（LLM 防护）——此前无校验，超长
+    # Payload/模型异常输出直接落库，通知列表渲染/上下文膨胀。
+    for _f, _v, _max in (("title", title, 200), ("body", body, 2000)):
+        _r = _check_text_len(_v, _f, _max)
+        if _r is not None:
+            return _r
     # P1-8 修复（2026-08-13）：due_at 格式校验（fail-closed）——此前 due_at 原样
     # 落库不校验，畸形值（"明天"、随机串）污染通知到期语义且无法排序。
     # 合法：YYYY-MM-DD 日期 或 ISO 8601 datetime（可含时区）。非空即校验。
@@ -1260,6 +1309,10 @@ def update_notification_status(notification_id: str, new_status: str,
     if not isinstance(resolution_note, str):
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"resolution_note 必须为字符串，收到：{resolution_note!r}"}
+    # P1-3（2026-08-18）：resolution_note 长度上限（LLM 防护）。
+    _r = _check_text_len(resolution_note, "resolution_note", 2000)
+    if _r is not None:
+        return _r
     with _STORE_LOCK:
         nid = str(notification_id).strip()
         rec = get_repository().load_notification(nid)

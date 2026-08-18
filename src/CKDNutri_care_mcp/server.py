@@ -169,11 +169,16 @@ def _ots_selfcheck() -> None:
         logger.info("[ots-selfcheck] JSON 开发后端，跳过 OTS 连通自检")
         return
     try:
-        from .repository import get_repository
+        from .repository import get_repository, ensure_tablestore_tables
 
         repo = get_repository()
         tables = repo._get_client().list_table()
         logger.info("[ots-selfcheck] OK 已连通表格存储，表=%s", sorted(tables))
+        # D4（2026-08-18）：部署即初始化缺失表（幂等）——此前 ensure_tablestore_tables
+        # 零调用点，魔搭新实例部署后 followup_store/notification_store 表不存在，读写
+        # 全 INTERNAL_ERROR（CARE_DATA，用户已实测）。ensure_tables 仅建缺失表，
+        # 不影响已建表/存量数据（用户手动建的表现在跳过）。
+        ensure_tablestore_tables()
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "[ots-selfcheck] FAIL 无法连接表格存储（%s）。检查 A207_OTS_* "

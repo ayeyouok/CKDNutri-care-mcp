@@ -41,6 +41,8 @@ from a207_policy import atomic_write_json, resolve_state_path
 from a207_policy.storage import (
     TablestoreBase,
     ensure_json_backend_allowed,
+    is_condition_conflict,  # 2026-08-19（care BUG-1）：条件冲突判定公共函数
+    register_json_list_field,  # 2026-08-19（care BUG-4）：JSON list 字段严格合并
     register_monotonic_field,  # 2026-08-15：共享 Tablestore 基础设施
 )
 
@@ -52,6 +54,12 @@ from a207_policy.storage import (
 register_monotonic_field("workflow_status", {
     "unacked": 0, "confirmed": 1, "resolved": 2, "closed": 3,
 })
+# 审查（2026-08-19，care BUG-4）：随访列表字段（records/plans/adherence）注册为
+# JSON list 语义字段——storage._merge_row 冲突合并时旧值损坏/非 list 一律抛错拒绝
+# 覆盖（fail-closed，损坏数据不得被新值静默淹没；与 _deserialize_followup 读取端
+# 的类型校验双保险）。
+for _f in ("records", "plans", "adherence"):
+    register_json_list_field(_f)
 
 logger = logging.getLogger("CKDNutri-care-mcp.repository")
 
@@ -267,7 +275,7 @@ class TablestoreRepository(TablestoreBase):
                 out[key] = []
             elif isinstance(raw, str):
                 try:
-                    out[key] = json.loads(raw)
+                    parsed = json.loads(raw)
                 except json.JSONDecodeError as exc:
                     # P3-2（2026-08-15）：数据损坏是**服务端存储问题**，抛 RuntimeError
                     # （归 INTERNAL_ERROR + 脱敏）——此前 ValueError 被 server 转
@@ -276,6 +284,16 @@ class TablestoreRepository(TablestoreBase):
                     raise RuntimeError(
                         f"随访数据列 {key} 损坏（非法 JSON）：拒绝静默清空，"
                         "请人工修复 Tablestore 该行数据") from exc
+                # 审查（2026-08-19，care BUG-3）：json.loads 成功 ≠ 类型正确——
+                # {} / 123 / null / "hello" 都是合法 JSON 但**不是 list**；随访列表
+                # 列契约必须是 JSON 数组，非 list 一律 fail-closed（错误类型数据
+                # 不得进入业务层，否则遍历/索引直接崩或静默丢数据）。
+                if not isinstance(parsed, list):
+                    raise RuntimeError(
+                        f"随访数据列 {key} 类型错误：期望 JSON 数组，实际为 "
+                        f"{type(parsed).__name__}（{raw[:80]!r}），拒绝静默降级"
+                        "——请人工修复 Tablestore 该行数据")
+                out[key] = parsed
             elif isinstance(raw, list):
                 out[key] = raw
             else:
@@ -339,6 +357,11 @@ class TablestoreRepository(TablestoreBase):
         # 创建同事件通知的唯一幂等保证：确定性事件主键已存在 → SDK 抛 OTSClientError
         # → 返回 False（不覆盖现有行，防重复入队）。乐观锁 _save_row_locked 只护
         # "已有主键"的更新，对新建行无条件放行，无法拦并发重复插入。
+        # 审查（2026-08-19，care BUG-1）：**只有条件检查冲突才返回 False**——此前
+        # 捕获所有 OTSClientError 转 False，网络错误/超时/鉴权失败/表不存在/参数错误
+        # 全被误判为"数据已存在（DUPLICATE）"，真实故障被静默吞掉（调用方收到
+        # DUPLICATE 会停止重试，通知可能永远缺失）。判定收敛到公共函数
+        # is_condition_conflict（与 _save_row_locked 共用，口径一致）。
         from tablestore import OTSClientError
 
         attrs = self._serialize_notification(rec)
@@ -346,8 +369,10 @@ class TablestoreRepository(TablestoreBase):
             self._put_row_not_exist(
                 TABLE_NOTIFICATION, self._pk_nid(notification_id), attrs)
             return True
-        except OTSClientError:
-            return False  # 主键已存在（同事件通知已创建）→ 幂等去重命中
+        except OTSClientError as exc:
+            if is_condition_conflict(exc):
+                return False  # 主键已存在（同事件通知已创建）→ 幂等去重命中
+            raise  # 网络/超时/鉴权/表不存在等环境问题 → 继续抛，不得误判 DUPLICATE
 
     def all_notifications(self) -> list[dict[str, Any]]:
         rows = self._range_all(TABLE_NOTIFICATION, ["notification_id"])

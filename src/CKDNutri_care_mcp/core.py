@@ -177,6 +177,31 @@ _VISIT_TYPES = frozenset({"outpatient", "phone", "online", "dialysis", "nutritio
 # 如每日多次写入累积数十年）单次返回撑爆 LLM 上下文；正常患儿（数十年随访）
 # 也远低于此，limit=None 默认全量兼容，仅超上限截断。
 _FOLLOWUP_RECORD_CAP = 10_000
+# 审查（2026-08-19，care BUG-7）：plans 数量上限——记录有上限但 plans 没有，
+# 异常写入可让 plans 无限增长（存储膨胀 + 单次返回上下文爆）。与记录同上限
+# 10,000；超过时保留最新（按 created_at/追加序）。
+_FOLLOWUP_PLAN_CAP = 10_000
+# 审查（2026-08-19，care BUG-5）：source_event 最大长度（事件标识，LLM/编排层
+# 可注入超长串，进 hash/Tablestore 主键/日志均有害）。
+_MAX_SOURCE_EVENT_LEN = 200
+# 审查（2026-08-19，care BUG-8）：notification_id 最大长度（超过则拒绝，防止
+# 超长串进入 hash/Tablestore 主键与日志）。
+_MAX_NOTIFICATION_ID_LEN = 128
+
+
+def _validate_notification_id(notification_id: Any) -> dict | None:
+    """校验并规范化 notification_id（审查 BUG-8，ack/update/escalate 三入口共用）。
+
+    规则：非 str → 拒绝；strip 后为空 → 拒绝；长度 > 128 → 拒绝（超长串进
+    hash/Tablestore 主键/日志均有害）。返回错误信封或 None（合法，调用方自行
+    str(notification_id).strip() 使用）。
+    """
+    if not isinstance(notification_id, str) or not notification_id.strip():
+        return {"ok": False, "error": "INVALID_INPUT", "detail": "notification_id 不能为空"}
+    if len(notification_id.strip()) > _MAX_NOTIFICATION_ID_LEN:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"notification_id 超过 {_MAX_NOTIFICATION_ID_LEN} 字符上限，拒绝处理"}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +319,13 @@ def _mask_notification(rec: dict, caller: str) -> dict:
                 out["escalated_history"] = [
                     ({k2: v2 for k2, v2 in h.items() if k2 != "by"}
                      if isinstance(h, dict) else h) for h in parsed]
+            else:
+                # 审查（2026-08-19，care BUG-6）：JSON 合法但**顶层非 list**
+                # （{"by": "doctor"} / 123 / "hello"）——旧实现落在两个分支之间，
+                # 原始串原样保留给家长（若含 by 即泄露医生身份，fail-open）。
+                # 非 list 一律剥除整个字段（fail-closed：宁可看不到，不漏未经
+                # 脱敏的原始数据）。
+                out.pop("escalated_history", None)
         except (json.JSONDecodeError, TypeError):
             # F5/C 审计（2026-08-17）：JSON 损坏时**剥除整个字段**（fail-closed）——
             # 此前 pass 保留原样，若损坏串含 by 即泄露医生身份（fail-open 方向）。
@@ -317,9 +349,15 @@ def _visible_record(rec: dict, caller: str) -> dict:
 
 
 def _visible_plan(plan: dict, caller: str) -> dict:
+    """患者/家属角色剔除医生内部字段（与 _visible_record 同口径，审查 BUG-2）。
+
+    此前仅剥 note_to_clinician，created_by（创建计划的医生身份）漏网直透家长
+    （PII 级）——与 _visible_record 剥 created_by 的 L-2 修复不对称。
+    """
     out = dict(plan)
     if caller not in _CLINICIAN:
         out.pop("note_to_clinician", None)
+        out.pop("created_by", None)
     return out
 
 
@@ -417,6 +455,16 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
         "created_by": caller,
         "created_at": _now_iso(),
     }
+    # 审查（2026-08-19，care BUG-10）：计划幂等指纹——plan_id 是随机 id，调用方
+    # 超时重试同一请求（同患者/基准日/类型/内容/操作者）会创建两个完全相同计划。
+    # 幂等指纹 = sha1(患者|基准日|类型|分期|摘要|备注|操作者)，创建前查重：命中
+    # 已有计划 → 幂等返回（idempotent_hit=true），不创建第二个。不同医生有意创建
+    # 相同计划（操作者不同）不幂等，符合"重试幂等、主动创建放行"语义。
+    _idem_key = hashlib.sha1(
+        (f"{patient_id}|{visit_date}|{visit_type}|{ckd_stage}|{albuminuria_stage}"
+         f"|{plan_summary}|{note_to_clinician}|{caller}").encode()
+    ).hexdigest()[:24]
+    plan["idempotency_key"] = _idem_key
     with _STORE_LOCK:
         p = get_repository().load_followup(patient_id)
         if p is None:
@@ -424,7 +472,16 @@ def schedule_followup(patient_id: str, ckd_stage: str, albuminuria_stage: str,
         p.setdefault("records", [])
         p.setdefault("plans", [])
         p.setdefault("adherence", [])
+        # BUG-10：幂等查重——已有同指纹计划 → 返回已有计划（不新建、不重复通知）
+        for _existing in p["plans"]:
+            if isinstance(_existing, dict) and _existing.get("idempotency_key") == _idem_key:
+                return {"ok": True, "data": {"plan": _existing, "idempotent_hit": True,
+                                             "note": "相同随访计划已存在（幂等命中），未重复创建"}}
         p["plans"].append(plan)
+        # 审查（2026-08-19，care BUG-7）：plans 数量上限——超过保留最新（追加序尾段），
+        # 防异常写入无限增长（存储膨胀 + 单次返回上下文爆）。
+        if len(p["plans"]) > _FOLLOWUP_PLAN_CAP:
+            p["plans"] = p["plans"][-_FOLLOWUP_PLAN_CAP:]
         get_repository().save_followup(patient_id, p)
     # 写操作由临床角色发起，返回完整计划
     return {"ok": True, "data": {"plan": plan}}
@@ -493,6 +550,12 @@ def get_followup_records(patient_id: str, guardian_token: str | None = None,
     # P3 其余（2026-08-15）：随访记录按 visit_date 升序返回——此前原样透传存储顺序
     # （追加序），家长/临床视角时间线混乱，趋势性阅读依赖调用方自行排序。
     records = sorted(records, key=lambda r: str(r.get("visit_date") or ""))
+    # 审查（2026-08-19，care BUG-11）：plans **稳定排序**——按 next_due_date 升序，
+    # 缺失 next_due_date 用 anchor_date 兜底（均缺失的保持存储相对顺序；同值稳定）。
+    # records 已有 visit_date 排序，plans 此前原样透传追加序（时间线混乱）。
+    plans = sorted(plans, key=lambda x: str(
+        (x.get("cadence") or {}).get("next_due_date")
+        or (x.get("cadence") or {}).get("anchor_date") or ""))
     # L-3（2026-08-16）：分页截断——超限保护（记录数异常时防 LLM 上下文爆）：
     # limit=None 默认全量（向后兼容），显式 limit 按 offset 分页；_FOLLOWUP_RECORD_CAP
     # 为绝对上限（远超正常随访量，仅防御异常数据）。
@@ -957,6 +1020,23 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"category 必须是 followup_due / risk_alert / report_ready，"
                           f"收到：{category!r}"}
+    # 审查（2026-08-19，care BUG-5）：source_event 严格类型/长度校验——此前
+    # `str(source_event)` 自动转类型，{} / [] / 123 都会被接受（污染去重键/主键
+    # hash/日志）。规则：None 或字符串；非字符串 → INVALID_INPUT；strip 后为空 →
+    # 按 None 处理（手动通知语义）；超过 200 字符 → INVALID_INPUT。
+    if source_event is not None and not isinstance(source_event, str):
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"source_event 必须为字符串或空（None），收到：{source_event!r}"}
+    if isinstance(source_event, str):
+        _se = source_event.strip()
+        if not _se:
+            source_event = None  # 空串按 None（手动通知）处理
+        elif len(_se) > _MAX_SOURCE_EVENT_LEN:
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"source_event 超过 {_MAX_SOURCE_EVENT_LEN} 字符上限"
+                              f"（收到 {len(_se)}），拒绝处理"}
+        else:
+            source_event = _se
     # P1-3（2026-08-18）：title/body 长度上限（LLM 防护）——此前无校验，超长
     # Payload/模型异常输出直接落库，通知列表渲染/上下文膨胀。
     for _f, _v, _max in (("title", title, 200), ("body", body, 2000)):
@@ -1269,9 +1349,11 @@ def ack_notification(notification_id: str, guardian_token: str | None = None) ->
         # C-B7 修复（2026-08-14）：notification_id 显式 strip + None/空拒绝——
         # 此前未 strip（" abc " 查不到归 NOT_FOUND，语义误导）；None 穿透可能让
         # Tablestore 端用非法主键构造请求（JSON 端 store.get(None) 返回 None 掩盖）。
-        if notification_id is None or not str(notification_id).strip():
-            return {"ok": False, "error": "INVALID_INPUT",
-                    "detail": "notification_id 不能为空"}
+        # 审查（2026-08-19，care BUG-8）：长度上限校验（>128 拒绝，防超长串进
+        # hash/主键/日志）。
+        _nid_err = _validate_notification_id(notification_id)
+        if _nid_err is not None:
+            return _nid_err
         notification_id = str(notification_id).strip()
         rec = get_repository().load_notification(notification_id)
         if rec is None:
@@ -1335,8 +1417,10 @@ def update_notification_status(notification_id: str, new_status: str,
                 "detail": f"status 必须是 {sorted(_WORKFLOW_ALLOWED)} 之一"}
     # 潜在 3（2026-08-14）：notification_id None 显式拒绝——此前 None.strip()
     # 抛 AttributeError 被 server _invalid 归 INTERNAL_ERROR（500 类），误导排障。
-    if not notification_id or not str(notification_id).strip():
-        return {"ok": False, "error": "INVALID_INPUT", "detail": "notification_id 不能为空"}
+    # 审查（2026-08-19，care BUG-8）：长度上限校验（共用 _validate_notification_id）。
+    _nid_err = _validate_notification_id(notification_id)
+    if _nid_err is not None:
+        return _nid_err
     # P2-1（2026-08-18）：resolution_note 类型保护——此前对 int/None 走
     # `(resolution_note or "").strip()` 抛 AttributeError→500（INTERNAL_ERROR）。
     if not isinstance(resolution_note, str):
@@ -1401,8 +1485,10 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
     if denied:
         return denied
     # 潜在 3（2026-08-14）：None 显式拒绝（对齐 update_notification_status）
-    if not notification_id or not str(notification_id).strip():
-        return {"ok": False, "error": "INVALID_INPUT", "detail": "notification_id 不能为空"}
+    # 审查（2026-08-19，care BUG-8）：长度上限校验（共用 _validate_notification_id）。
+    _nid_err = _validate_notification_id(notification_id)
+    if _nid_err is not None:
+        return _nid_err
     # P2-1（2026-08-18）：reason 类型保护——此前对 int/None 走 reason.strip() 抛
     # AttributeError→500（INTERNAL_ERROR），与 resolution_note 同口径。
     if not isinstance(reason, str):

@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
 """C-S1/C-S2/C-B3/C-B4/C-B7/D1 回归测试（2026-08-14 修复后固化）。pytest + 直接运行双模式。"""
 import os
+
 os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 os.environ.setdefault("A207_ACCEPT_DEV_STORAGE", "1")  # 生产护栏（2026-08-15）：测试进程显式确认 json 后端为开发模式
 import sys
@@ -93,7 +93,7 @@ def test_d1_parent_notification_masked():
     家长读路径需 guardian_token 才能过 _guard_guardian，用 token 链路会使本测试
     依赖 P1 签发，故直接验证裁剪函数本体（同一 _CLINICIAN 判定）。
     """
-    from CKDNutri_care_mcp.core import _mask_notification, _NOTIF_CLINICIAN_ONLY
+    from CKDNutri_care_mcp.core import _NOTIF_CLINICIAN_ONLY, _mask_notification
 
     rec = {"id": "N-1", "patient_id": "P0001", "title": "标题", "status": "unacked",
            "workflow_status": "resolved", "escalated": True,

@@ -8,13 +8,11 @@ from __future__ import annotations
 import inspect
 import logging
 import math
-
 from functools import wraps
-from typing import Any, Literal, Optional
-
-from fastmcp import FastMCP
+from typing import Any, Literal
 
 from a207_policy import translate_error
+from fastmcp import FastMCP
 
 from .core import (
     _BASE_INTERVAL_DAYS,
@@ -104,7 +102,7 @@ def _sanitize_value(key: str, val: Any, depth: int = 0) -> Any:
     return val
 
 
-def _sanitize_bound_args(bound_args: Optional[dict[str, Any]]) -> dict[str, Any]:
+def _sanitize_bound_args(bound_args: dict[str, Any] | None) -> dict[str, Any]:
     """把已按形参名归一化的参数字典整体递归脱敏（日志专用，不进客户端 detail）。"""
     if not bound_args:
         return {}
@@ -112,7 +110,7 @@ def _sanitize_bound_args(bound_args: Optional[dict[str, Any]]) -> dict[str, Any]
 
 
 def _invalid(exc: Exception, tool: str = "unknown",
-             bound_args: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+             bound_args: dict[str, Any] | None = None) -> dict[str, Any]:
     # B2 中心化（2026-08-15）：异常翻译收敛到 a207_policy.translate_error 单实现；
     # bound_args 脱敏（guardian_token 等敏感值不进日志）保留在本层（care 特有防御）。
     safe_args = _sanitize_bound_args(bound_args)
@@ -169,7 +167,7 @@ def _ots_selfcheck() -> None:
         logger.info("[ots-selfcheck] JSON 开发后端，跳过 OTS 连通自检")
         return
     try:
-        from .repository import get_repository, ensure_tablestore_tables
+        from .repository import ensure_tablestore_tables, get_repository
 
         repo = get_repository()
         tables = repo._get_client().list_table()
@@ -179,7 +177,7 @@ def _ots_selfcheck() -> None:
         # 全 INTERNAL_ERROR（CARE_DATA，用户已实测）。ensure_tables 仅建缺失表，
         # 不影响已建表/存量数据（用户手动建的表现在跳过）。
         ensure_tablestore_tables()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error(
             "[ots-selfcheck] FAIL 无法连接表格存储（%s）。检查 A207_OTS_* "
             "环境变量与网络后重试；服务未启动。", type(exc).__name__)
@@ -223,8 +221,8 @@ def schedule_followup_tool(
 
 @mcp.tool
 @handle_mcp_exceptions
-def get_followup_records_tool(patient_id: str, guardian_token: Optional[str] = None,
-                              limit: Optional[int] = None,
+def get_followup_records_tool(patient_id: str, guardian_token: str | None = None,
+                              limit: int | None = None,
                               offset: int = 0) -> dict[str, Any]:
     """查随访历史（含计划 + 下次到期日）。按身份视图裁剪；家长需携带 guardian_token。
 
@@ -243,7 +241,7 @@ def add_followup_record_tool(
     visit_date: str,
     visit_type: VisitType,
     ckd_stage: CKDStage,
-    indicators_snapshot: Optional[dict[str, Any]] = None,
+    indicators_snapshot: dict[str, Any] | None = None,
     plan_summary: str = "",
     doctor_notes: str = "",
 ) -> dict[str, Any]:
@@ -276,7 +274,7 @@ def get_adherence_score_tool(
     diet_ratio: float,
     med_ratio: float,
     visit_ratio: float,
-    weights: Optional[list[float]] = None,
+    weights: list[float] | None = None,
 ) -> dict[str, Any]:
     """计算并落库依从性评分。仅 CKD 临床助手可写。
 
@@ -304,8 +302,8 @@ def get_adherence_score_tool(
 @handle_mcp_exceptions
 def get_pew_timeline_tool(
     patient_id: str,
-    guardian_token: Optional[str] = None,
-    pew_history: Optional[list[dict[str, Any]]] = None,
+    guardian_token: str | None = None,
+    pew_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """查询 PEW 历史，与随访时间线合并展示。家长需携带 guardian_token。
 
@@ -332,9 +330,9 @@ def get_notifications_tool(
     patient_id: str,
     status: NotificationStatus = "all",
     workflow_status: WorkflowStatus = "all",
-    escalated: Optional[bool] = None,
-    guardian_token: Optional[str] = None,
-    page: Optional[int] = None,
+    escalated: bool | None = None,
+    guardian_token: str | None = None,
+    page: int | None = None,
     page_size: int = 50,
 ) -> dict[str, Any]:
     """查通知列表。status 按已读（all/unacked/acked）；workflow_status 按闭环状态
@@ -353,7 +351,7 @@ def get_notifications_tool(
 
 @mcp.tool
 @handle_mcp_exceptions
-def ack_notification_tool(notification_id: str, guardian_token: Optional[str] = None) -> dict[str, Any]:
+def ack_notification_tool(notification_id: str, guardian_token: str | None = None) -> dict[str, Any]:
     """确认通知（幂等）。家长需携带 guardian_token 且与通知所属患者绑定。"""
     return ack_notification(notification_id=notification_id, guardian_token=guardian_token)
 
@@ -365,7 +363,7 @@ def ack_notification_tool(notification_id: str, guardian_token: Optional[str] = 
 def trigger_event_notification_tool(
     event_type: EventType,
     patient_id: str,
-    payload: Optional[dict[str, Any]] = None,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """事件触发的通知创建：事件类型→模板填充→落库→推送 一键完成（DAG）。
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """CKDNutri-care-mcp：儿童 CKD 随访沟通域（P3，合并自 M4 随访 + M10 通知）。
 
 职责（对应 PCP 契约 follow_up / notification 输出位）：
@@ -48,17 +47,17 @@ __version__ = _pkg_version()
 
 __all__ = [
     "__version__",
-    "get_followup_records",
+    "ack_notification",
     "add_followup_record",
-    "get_adherence_score",
-    "get_pew_timeline",
-    "schedule_followup",
-    "recommend_followup_interval",
+    "build_event_notification",
     "calc_adherence_score",
     "create_notification",
     "escalate_notification",
+    "get_adherence_score",
+    "get_followup_records",
     "get_notifications",
-    "ack_notification",
+    "get_pew_timeline",
+    "recommend_followup_interval",
+    "schedule_followup",
     "update_notification_status",
-    "build_event_notification",
 ]

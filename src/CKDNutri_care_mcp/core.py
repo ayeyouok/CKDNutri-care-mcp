@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M4 核心逻辑（纯函数，无 fastmcp 依赖，可单测）。
 
 内容：
@@ -23,11 +22,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
+import re
 import threading
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any
 
 from a207_policy import (
     FOLLOWUP_CLINICIAN,
@@ -243,7 +242,8 @@ def _require_iso_date(value: Any, field: str = "visit_date",
         # 一律拒绝（fail-closed）。
         d = datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
     except (TypeError, ValueError):
-        raise ValueError(f"{field} 必须为 YYYY-MM-DD 格式，收到：{value!r}")
+        # 输入校验失败，原始异常类型无诊断价值（B904：显式切断异常链）
+        raise ValueError(f"{field} 必须为 YYYY-MM-DD 格式，收到：{value!r}") from None
     # L（2026-08-16，第七轮审查）：未来日期判断统一 UTC 业务日——此前 date.today()
     # 本地 naive，与全局 UTC 口径（_today()/_now_iso()）脱节，跨时区部署漂移。
     if not allow_future and d > datetime.now(timezone.utc).date():
@@ -774,7 +774,7 @@ def _check_text_len(value: str, field: str, max_len: int) -> dict | None:
     return None
 
 
-def _parse_pew_date(value: Any) -> Optional[datetime]:
+def _parse_pew_date(value: Any) -> datetime | None:
     """解析 PEW 历史日期为 datetime；无效/缺失返回 None（BUG-67，对齐 content 包）。
 
     上游 M3 契约=ISO 升序，此处防御性解析——"/"、"." 分隔转 "-" 后 fromisoformat；
@@ -906,6 +906,24 @@ def get_pew_timeline(patient_id: str, guardian_token: str | None = None,
 
 
 # ---- M10: notification engine ----
+def _derive_reopen_id(closed_id: str, id_base: str) -> str:
+    """从 closed 事件通知 id 派生**确定性重开 id**（审查 P1-4，2026-08-18）。
+
+    事件通知主键 = "N" + 24-hex id_base（第一代，代数 0）；重开实例 =
+    "N{id_base}-R{gen}"（代数 1, 2, ...）。从 closed_id 解析当前代数 +1 即下一代的
+    确定性键：两个 worker 并发重开同一 closed 事件时**竞争同一键**，存储层
+    EXPECT_NOT_EXIST 条件插入保证只落一个实例（另一个 DUPLICATE）——原随机 uuid
+    后缀会让两个 worker 各自生成不同 id 双开成功（两个 reopen 实例都 unacked，
+    家长收到两条同事件提醒）。closed_id 无法解析（历史/手工数据异常形态）时保守
+    回退随机 id（保持放行语义，防误拒）。
+    """
+    m = re.match(r"^N([0-9A-F]{24})(?:-R(\d+))?$", str(closed_id or ""))
+    if m:
+        gen = int(m.group(2) or "0") + 1
+        return f"N{m.group(1)}-R{gen}"
+    return "N" + id_base + "-R" + uuid.uuid4().hex[:6].upper()
+
+
 def create_notification(patient_id: str, category: str, priority: str, title: str, body: str, due_at: str | None = None,
                         source_event: str | None = None) -> dict[str, Any]:
     """直接创建一条通知（写，仅编排/临床角色）。
@@ -914,7 +932,7 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
     BUG-11 修复：补齐闭环字段 workflow_status / status_updated_by / status_updated_at
     （需求 §5.2：家长视角 get_notifications 需看到 workflow_status 字段）。
     """
-    caller = get_caller()
+    get_caller()  # P0-1 身份校验副作用（未设置/非法 A207_CALLER 抛 CallerUnknown）；本函数返回值未用
     # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
     # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
     try:
@@ -984,33 +1002,38 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
             # 去重失效生成两条；规范化后同刻同键。
             canon_due = _canonicalize_due(due_at)
             dup_key = (category, str(source_event).strip(), canon_due)
-            # H3（2026-08-16，第七轮审查）：confirmed 也应拦——此前
-            # not in ("closed", "confirmed") 把已确认通知排除在去重外，
-            # 编排/HAIP 对同事件重试会再创建重复通知（架空去重，疑似笔误）。
-            # 去重目的：同事件不重复入队；confirmed 表示事件已处理，重试
-            # 仍应拒绝（事件未变）。仅 closed 放行（可重新开事件）。
-            for existing in get_repository().all_notifications():
-                if existing.get("patient_id") == patient_id \
-                        and (existing.get("category"), existing.get("source_event") or "",
-                             _canonicalize_due(existing.get("due_at"))) == dup_key \
-                        and existing.get("workflow_status") not in ("closed",):
-                    return {"ok": False, "error": "DUPLICATE",
-                            "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
-                                      f"已有未关闭通知 {existing.get('id')}，拒绝重复创建；"
-                                      "可对该通知执行 ack/escalate 处理"}
-        # P0-1（2026-08-18）：**事件驱动通知用确定性幂等主键**（不再随机 uuid）——
-        # 主键 = sha1(patient|category|source_event|规范化 due_at)。跨 Worker/多进程
-        # 并发创建同事件通知时，repository 的 EXPECT_NOT_EXIST 条件插入（Tablestore）/
-        # 锁内查主键（JSON）保证只落一行：先到者成功、后到者 DUPLICATE。手动通知
-        # （无 source_event）维持随机 id（临床主动行为不幂等，同既有语义）。
-        # P0 衍生 3（2026-08-18）：主键 hash 由 12 hex（48-bit）扩至 **24 hex（96-bit）**
-        # ——千万级数据量下 48-bit Birthday Collision 会撞号、新事件被误判 DUPLICATE
-        # 静默丢通知；96-bit 在亿级下碰撞概率可忽略。
-        if source_event:
+            # P0-1（2026-08-18）：事件主键 = 确定性 hash（见下方 nid 计算）——先算
+            # id_base/nid，供 O(1) 查重复用（避免重复构造）。
             id_key = (f"{patient_id}|{category}|{str(source_event).strip()}|{canon_due}")
             id_base = hashlib.sha1(id_key.encode("utf-8")).hexdigest()[:24].upper()
             nid = "N" + id_base
+            # 审查 P2-1（2026-08-18）：**O(1) 查重优先**——P0-1 后同事件通知主键即
+            # 确定性 id，按主键读一次即可判断（替代 create_notification 每次触发都
+            # all_notifications() 全表 GetRange 的 O(total) 扫描）。命中：
+            #   未 closed → DUPLICATE（精确，无扫描）；
+            #   closed → 去重放行（走下方重开逻辑）。
+            # 主键未命中 → 全表扫描兜底，兼容 P0-1 上线前的历史随机 id 通知
+            # （通知表主键为 notification_id 单列，无法按 patient_id 前缀查询；
+            # 兜底仅在历史数据场景触发，新事件零扫描）。
+            _dedup = get_repository().load_notification(nid)
+            if _dedup is not None:
+                if _dedup.get("workflow_status") not in ("closed",):
+                    return {"ok": False, "error": "DUPLICATE",
+                            "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
+                                      f"已有未关闭通知 {_dedup.get('id')}，拒绝重复创建；"
+                                      "可对该通知执行 ack/escalate 处理"}
+            else:
+                for existing in get_repository().all_notifications():
+                    if existing.get("patient_id") == patient_id \
+                            and (existing.get("category"), existing.get("source_event") or "",
+                                 _canonicalize_due(existing.get("due_at"))) == dup_key \
+                            and existing.get("workflow_status") not in ("closed",):
+                        return {"ok": False, "error": "DUPLICATE",
+                                "detail": f"该事件（{category}/{source_event}/due {due_at or '无'}）"
+                                          f"已有未关闭通知 {existing.get('id')}，拒绝重复创建；"
+                                          "可对该通知执行 ack/escalate 处理"}
         else:
+            # 手动通知（无 source_event）维持随机 id（临床主动行为不幂等，同既有语义）
             nid = "N" + uuid.uuid4().hex[:12].upper()
         rec = {
             "id": nid,
@@ -1034,12 +1057,22 @@ def create_notification(patient_id: str, category: str, priority: str, title: st
         if source_event:
             # P0-1：条件插入（跨进程幂等）——主键已存在 → 未关闭 = 并发/重复 → DUPLICATE；
             # **closed（终态）→ 重开新实例**（既有语义"仅 closed 放行，可重新开事件"，
-            # 见上 H3 注释）——确定性主键与 closed 重开冲突，重开时生成 -R<随机> 实例
-            # 主键放行（重开是人工操作路径，无需确定性；并发重试仍由条件插入拦截）。
+            # 见上 H3 注释）。审查 P1-4（2026-08-18）：重开主键改为**确定性派生**
+            # （_derive_reopen_id：N{base} 第 0 代 → R1 → R2 …，见该函数 docstring）——
+            # 原 "-R<随机>" 后缀在多 worker 并发重开同一 closed 事件时生成两个不同
+            # id 均插入成功（双 reopen 实例）；确定性键让并发 worker 竞争同一 id，
+            # EXPECT_NOT_EXIST 条件插入仍为硬约束（只落一个，另一个 DUPLICATE）。
+            # 连续重开（R1 已 closed）时循环推进代数 → R2（同事件多轮提醒可追溯）。
             if not get_repository().save_notification_expect_not_exist(nid, rec):
                 existing = get_repository().load_notification(nid)
                 if existing is not None and existing.get("workflow_status") == "closed":
-                    reopen_id = "N" + id_base + "-R" + uuid.uuid4().hex[:6].upper()
+                    reopen_id = _derive_reopen_id(existing.get("id", ""), id_base)
+                    while True:
+                        _prev = get_repository().load_notification(reopen_id)
+                        if _prev is not None and _prev.get("workflow_status") == "closed":
+                            reopen_id = _derive_reopen_id(reopen_id, id_base)  # 代数 +1
+                            continue
+                        break
                     rec["id"] = reopen_id
                     if not get_repository().save_notification_expect_not_exist(reopen_id, rec):
                         return {"ok": False, "error": "DUPLICATE",
@@ -1062,7 +1095,7 @@ def build_event_notification(event_type: str, patient_id: str, payload: dict[str
     payload 字段依据事件类型：followup_due->next_due_date(+可选 due_at)；
     risk_escalation->from_level,to_level,rule；report_ready->(无需额外字段)。
     """
-    caller = get_caller()
+    get_caller()  # P0-1 身份校验副作用（未设置/非法 A207_CALLER 抛 CallerUnknown）；本函数返回值未用
     # N1 修复（2026-08-13）：统一 patient_id 契约校验（a207_policy.validate_patient_id
     # ^P[0-9]{4,}$，与 P1 his 同口径）——畸形 id 不进存储/查询层。
     try:
@@ -1375,6 +1408,11 @@ def escalate_notification(notification_id: str, reason: str = "") -> dict[str, A
     if not isinstance(reason, str):
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"reason 必须为字符串，收到：{reason!r}"}
+    # 审查 P2-2（2026-08-18）：reason 长度上限（LLM 防护，与其他文本字段同口径）——
+    # 此前仅类型校验，超长 reason 原样落库（escalated_history 审计膨胀 / 上下文占用）。
+    _r = _check_text_len(reason, "reason", 2000)
+    if _r is not None:
+        return _r
     with _STORE_LOCK:
         nid = str(notification_id).strip()
         rec = get_repository().load_notification(nid)

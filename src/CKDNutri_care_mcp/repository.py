@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """P3 随访沟通域 DAO 抽象层（v0.6：默认 Tablestore + json 开发模式）。
 
 设计目标（对齐 P1 clinical-data repository.py 模式）：
@@ -39,7 +38,20 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from a207_policy import atomic_write_json, resolve_state_path
-from a207_policy.storage import TablestoreBase, ensure_json_backend_allowed  # 2026-08-15：共享 Tablestore 基础设施
+from a207_policy.storage import (
+    TablestoreBase,
+    ensure_json_backend_allowed,
+    register_monotonic_field,  # 2026-08-15：共享 Tablestore 基础设施
+)
+
+# 审查 P1-3（2026-08-18，care 复审）：workflow_status 单调合并注册——storage 层
+# _merge_row 冲突重试合并对标量默认 new 优先，会对状态机字段造成回退（stale 写者
+# 的 confirmed 覆盖最新 resolved，见 a207_policy.storage 审查注释）。注册序值后
+# 冲突合并取高序值：unacked(0) < confirmed(1) < resolved(2) < closed(3)，低阶
+# 状态永不覆盖高阶（同值幂等、高阶推进合法）。模块加载时注册，幂等无害。
+register_monotonic_field("workflow_status", {
+    "unacked": 0, "confirmed": 1, "resolved": 2, "closed": 3,
+})
 
 logger = logging.getLogger("CKDNutri-care-mcp.repository")
 
@@ -142,7 +154,7 @@ def _read_json_file(path: Path, name: str) -> dict[str, Any]:
     """读 JSON 文件；缺失返回 {}；损坏/非 dict 抛 RuntimeError（fail-closed，
     对齐 core 既有 _load_store/_notify_load 的 BUG-65/67 语义）。"""
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         return {}
@@ -373,16 +385,16 @@ def get_repository() -> CareRepository:
 
 
 __all__ = [
+    "FOLLOWUP_DATA_DIR_ENV",
+    "FOLLOWUP_STORE_FILENAME",
+    "NOTIFICATION_DATA_DIR_ENV",
+    "NOTIFICATION_STORE_FILENAME",
+    "STORAGE_BACKEND_ENV",
+    "TABLE_FOLLOWUP",
+    "TABLE_NOTIFICATION",
     "CareRepository",
     "LocalJsonRepository",
     "TablestoreRepository",
     "ensure_tablestore_tables",
     "get_repository",
-    "TABLE_FOLLOWUP",
-    "TABLE_NOTIFICATION",
-    "FOLLOWUP_STORE_FILENAME",
-    "NOTIFICATION_STORE_FILENAME",
-    "FOLLOWUP_DATA_DIR_ENV",
-    "NOTIFICATION_DATA_DIR_ENV",
-    "STORAGE_BACKEND_ENV",
 ]

@@ -6,6 +6,9 @@ P2-1（O(1) 查重）/ P2-2（escalate reason 长度）。
 - closed → reopen 只落一个实例（EXPECT_NOT_EXIST 条件插入硬约束）
 - create_notification 事件去重走 O(1) 主键查询（不触发全表扫描路径）
 - escalate_notification reason 超长拒绝
+
+运行：pytest tests/test_regression_cs2.py（或 python tests/test_regression_cs2.py 直接运行，
+CI 的 publish workflow 逐文件 `python tests/test_*.py`，**不安装 pytest**——本文件不依赖 pytest）。
 """
 import os
 
@@ -22,19 +25,16 @@ for p in (_SRC, _POLICY):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-import pytest
-
 from CKDNutri_care_mcp import core
 
 
-@pytest.fixture(autouse=True)
-def _isolated_store():
-    """JSON 后端测试隔离：每次测试独立数据目录 + 重置 repo 缓存。
+def _reset_store() -> None:
+    """JSON 后端测试隔离：独立数据目录 + 重置 repo 缓存（每个测试开头调用）。
 
     事件通知主键是确定性 hash，JSON 文件若跨测试共享会残留旧状态
     （closed → R1 → R2 精确状态机被上次运行的残留数据污染），必须隔离。
+    不用 pytest fixture（CI 直接运行模式无 pytest），普通函数两模式通用。
     """
-    import shutil
     import tempfile
 
     from CKDNutri_care_mcp import repository as repo_mod
@@ -43,9 +43,16 @@ def _isolated_store():
     os.environ["A207_NOTIFICATION_DATA_DIR"] = tmp
     os.environ["A207_FOLLOWUP_DATA_DIR"] = tmp
     repo_mod._REPO_CACHE.clear()  # env 变更后重建（get_repository 按 backend 缓存）
-    yield
-    repo_mod._REPO_CACHE.clear()
-    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run_all() -> None:
+    """直接运行模式：执行本文件全部 test_* 函数（CI 的 `python tests/test_*.py`）。"""
+    import sys as _sys
+
+    for _name, _fn in sorted(vars(_sys.modules[__name__]).items()):
+        if _name.startswith("test_") and callable(_fn):
+            _fn()
+    print("P3 CS2 REGRESSION OK")
 
 
 def test_reopen_id_deterministic_derivation():
@@ -62,6 +69,7 @@ def test_reopen_id_deterministic_derivation():
 
 def test_reopen_only_one_instance_survives():
     """P1-4：closed 事件重开——两个 worker 顺序触发同事件，只落一个 reopen 实例。"""
+    _reset_store()
     # 第一次创建 → 手动 closed → 重开
     r1 = core.create_notification("P0002", "followup_due", "medium", "复诊提醒", "正文",
                                   due_at="2026-08-20", source_event="followup#E1")
@@ -98,6 +106,7 @@ def test_reopen_only_one_instance_survives():
 
 def test_event_dedup_o1_primary_key_path():
     """P2-1：事件查重走 O(1) 主键路径——未关闭通知重复触发即 DUPLICATE（不再扫描兜底）。"""
+    _reset_store()
     r = core.create_notification("P0003", "risk_alert", "high", "危急", "钾危急",
                                  due_at=None, source_event="risk#K")
     assert r["ok"] is True, r
@@ -112,6 +121,7 @@ def test_event_dedup_o1_primary_key_path():
 
 def test_escalate_reason_length_limit():
     """P2-2：escalate_notification reason 超长拒绝（2000 上限，LLM 防护）。"""
+    _reset_store()
     n = core.create_notification("P0004", "followup_due", "low", "t", "b",
                                  due_at="2026-08-21")
     nid = n["data"]["notification"]["id"]
@@ -119,3 +129,7 @@ def test_escalate_reason_length_limit():
     assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
     # 正常长度通过
     assert core.escalate_notification(nid, "临床升级")["ok"] is True
+
+
+if __name__ == "__main__":
+    _run_all()

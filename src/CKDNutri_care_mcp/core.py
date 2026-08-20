@@ -29,7 +29,10 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from a207_policy import (
+    DEMO_ALLOWED_PATIENTS,
+    DEMO_PARENT_ROLE,
     FOLLOWUP_CLINICIAN,
+    PARENT_EQUIVALENT_ROLES,
     PARENT_ROLE,
     PermissionDenied,
     enforce_read,
@@ -107,8 +110,15 @@ def _guard_guardian(caller: str, patient_id: str, guardian_token: str | None,
     （含过期校验，单一事实源，不在此维护副本）；家长必须携带与其患儿绑定的
     guardian_token 才能访问。
     """
-    if caller != PARENT_ROLE:
-        return None
+    if caller not in PARENT_EQUIVALENT_ROLES:
+        return None                      # 医生/风险管线：不进家长闸
+    if caller == DEMO_PARENT_ROLE:
+        # BUG-41（2026-08-20）修复：demo 身份此前被 `caller != PARENT_ROLE` 短路完全绕过
+        # 绑定（跨患儿越权）；现走免令牌分支，但须钉死到演示患儿集合。
+        if patient_id not in DEMO_ALLOWED_PATIENTS:
+            return {"ok": False, "error": "FORBIDDEN",
+                    "detail": f"demo 家长仅可访问演示患儿 {sorted(DEMO_ALLOWED_PATIENTS)}"}
+        return None                      # 免令牌，但已钉范围
     if not guardian_token:
         return {"ok": False, "error": "GUARDIAN_UNVERIFIED",
                 "detail": f"caller=parent_assistant 调用 {tool} 必须携带 guardian_token"}

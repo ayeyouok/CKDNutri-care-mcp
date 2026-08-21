@@ -35,6 +35,7 @@ from a207_policy import (
     PARENT_EQUIVALENT_ROLES,
     PARENT_ROLE,
     PermissionDenied,
+    RISK_LEVEL_RANK,
     enforce_read,
     enforce_write,
     get_caller,
@@ -1225,6 +1226,25 @@ def build_event_notification(event_type: str, patient_id: str, payload: dict[str
             if not isinstance(_v, str) or not _v.strip():
                 return {"ok": False, "error": "INVALID_PAYLOAD",
                         "detail": f"risk_escalation 事件必须提供非空字符串字段 {_f}"}
+        # BUG-66（2026-08-21）：risk_escalation **方向校验**——to_level 必须比
+        # from_level 更严重（L1>L2>L3，权威排序见 a207_policy.RISK_LEVEL_RANK）。
+        # 此前只校验非空字符串，L2→L3（实为降级）被当作"升级"入库，与 severity
+        # 模型矛盾（演示实测：高钾 6.8 被写成 L2→L3）。非法方向/非法等级显式
+        # INVALID_PAYLOAD（fail-closed，不静默落库脏方向）。
+        _from_level = payload["from_level"].strip()
+        _to_level = payload["to_level"].strip()
+        _fr = RISK_LEVEL_RANK.get(_from_level)
+        _tr = RISK_LEVEL_RANK.get(_to_level)
+        if _fr is None or _tr is None:
+            return {"ok": False, "error": "INVALID_PAYLOAD",
+                    "detail": f"risk_escalation 等级必须是 L1/L2/L3 之一，"
+                              f"收到 from={_from_level!r} to={_to_level!r}"}
+        if _tr <= _fr:
+            return {"ok": False, "error": "INVALID_PAYLOAD",
+                    "detail": f"risk_escalation 必须从更轻等级升到更重等级"
+                              f"（L1>L2>L3，严重度 L1=3/L2=2/L3=1），"
+                              f"收到 from={_from_level}({_fr}) → to={_to_level}({_tr})"
+                              " 为降级/持平，非法"}
     try:
         # BUG-65（2026-08-12）：payload 可能含 patient_id 键（编排层常见）——直接
         # .format(patient_id=patient_id, **payload) 会抛 TypeError: got multiple values
@@ -1295,11 +1315,21 @@ def get_notifications(patient_id: str,
     if workflow_status not in _VALID_WORKFLOW:
         return {"ok": False, "error": "INVALID_INPUT",
                 "detail": f"workflow_status 必须是 {sorted(_VALID_WORKFLOW)} 之一，收到：{workflow_status!r}"}
+    # BUG-66（2026-08-21）：按 patient_id 查询改走二级索引（query_notifications_by_patient，
+    # Tablestore 端按 patient_id 全局二级索引 GetRange，避免全表扫描——医院万级通知
+    # 量下 O(全表) 是扩展瓶颈）。索引不可用（未创建/查询异常）时防御性回退
+    # all_notifications() 全表扫描：索引是**性能优化，非正确性依赖**，降级不丢数据。
+    repo = get_repository()
+    try:
+        _raw = repo.query_notifications_by_patient(patient_id)
+    except Exception:  # noqa: BLE001 索引未就绪/异常 → 全表扫描兜底（兼容旧部署）
+        _raw = repo.all_notifications()
     items = [
-        r for r in get_repository().all_notifications()
+        r for r in _raw
         # B（2026-08-12 三审）：r["patient_id"]/r["status"] 硬索引改 .get() 统一——
         # 与下方 workflow_status/escalated 的 .get 风格一致，旧版本/手工写入缺键
-        # 记录不再 KeyError（此前混入缺键记录时整次读取崩溃）。
+        # 记录不再 KeyError（此前混入缺键记录时整次读取崩溃）。索引已按 patient_id
+        # 收窄，下方 r.get("patient_id") == patient_id 过滤为**保险**（防索引脏数据）。
         if r.get("patient_id") == patient_id
         and (status == "all" or r.get("status") == status)
         and (workflow_status == "all" or r.get("workflow_status", "unacked") == workflow_status)

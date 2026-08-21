@@ -331,6 +331,41 @@ def test_plans_sorted_by_next_due_date():
     assert dates == sorted(dates), dates  # 按 anchor_date（next_due_date 同序）升序
 
 
+# ---- BUG-66：risk_escalation 方向校验（L1>L2>L3，2026-08-21）----
+
+def test_bug66_risk_escalation_downgrade_rejected():
+    """BUG-66：L2→L3 是降级（L3<L2），必须 INVALID_PAYLOAD，不得当"升级"入库。
+
+    演示实测回归点：高钾 6.8（危急）被写成 L2→L3。修复后方向/等级非法一律拒绝。
+    """
+    _reset_store()
+    with as_caller("doctor_assistant"):
+        r = core.build_event_notification(
+            "risk_escalation", "P0024",
+            {"from_level": "L2", "to_level": "L3", "rule": "R-03"})
+    assert r["ok"] is False and r["error"] == "INVALID_PAYLOAD", r
+
+
+def test_bug66_risk_escalation_valid_upgrade_ok():
+    """BUG-66：L3→L1 是合法升级（5.0-5.5 偏高升到 >6.5 危急），创建成功。"""
+    _reset_store()
+    with as_caller("doctor_assistant"):
+        r = core.build_event_notification(
+            "risk_escalation", "P0024",
+            {"from_level": "L3", "to_level": "L1", "rule": "R-03"})
+    assert r["ok"] is True, r
+
+
+def test_bug66_risk_escalation_invalid_level_rejected():
+    """BUG-66：非法等级串（L9）fail-closed → INVALID_PAYLOAD，不静默当最低档。"""
+    _reset_store()
+    with as_caller("doctor_assistant"):
+        r = core.build_event_notification(
+            "risk_escalation", "P0024",
+            {"from_level": "L9", "to_level": "L1", "rule": "R-03"})
+    assert r["ok"] is False and r["error"] == "INVALID_PAYLOAD", r
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

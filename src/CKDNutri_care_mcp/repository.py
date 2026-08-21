@@ -79,6 +79,9 @@ STORAGE_BACKEND_ENV = "A207_STORAGE_BACKEND"
 # Tablestore 表名
 TABLE_FOLLOWUP = "followup_store"
 TABLE_NOTIFICATION = "notification_store"
+# 通知表 patient_id 全局二级索引名（BUG-66，2026-08-21）：按患者查通知走索引
+# GetRange，避免全表扫描；由 ensure_tablestore_tables 幂等创建。
+NOTIFICATION_INDEX_NAME = "idx_notification_patient"
 
 # 乐观锁版本列名（Tablestore 后端专用；JSON 后端无此列）
 _REV_COL = "_rev"
@@ -138,6 +141,12 @@ class CareRepository(Protocol):
 
     def all_notifications(self) -> list[dict[str, Any]]:
         """全量通知（供按 patient_id 过滤；Tablestore 用 GetRange）。"""
+        ...
+
+    def query_notifications_by_patient(self, patient_id: str) -> list[dict[str, Any]]:
+        """按 patient_id 查通知（BUG-66，2026-08-21）：索引后端按患者收窄，
+        避免全表扫描；索引不可用时实现方可抛异常，由调用方回退 all_notifications。
+        """
         ...
 
 
@@ -231,6 +240,11 @@ class LocalJsonRepository:
     def all_notifications(self) -> list[dict[str, Any]]:
         store = _read_json_file(_notification_json_path(), "通知库")
         return [r for r in store.values() if isinstance(r, dict)]
+
+    def query_notifications_by_patient(self, patient_id: str) -> list[dict[str, Any]]:
+        # BUG-66（2026-08-21）：JSON 后端本身按患者过滤（本地量级，无索引需求）；
+        # 与 Tablestore 索引后端接口对齐，供 core.get_notifications 统一调用。
+        return [r for r in self.all_notifications() if r.get("patient_id") == patient_id]
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +392,37 @@ class TablestoreRepository(TablestoreBase):
         rows = self._range_all(TABLE_NOTIFICATION, ["notification_id"])
         return [self._deserialize_notification(item["attrs"]) for item in rows]
 
+    def query_notifications_by_patient(self, patient_id: str) -> list[dict[str, Any]]:
+        """按 patient_id 走全局二级索引查询（BUG-66，2026-08-21）。
+
+        索引主键 (patient_id, notification_id)：GetRange 以 patient_id 前缀收窄，
+        复杂度从 O(全表) 降到 O(该患者通知数)。索引不可用（未创建/查询异常）时
+        抛 OTSClientError，由调用方（core.get_notifications）回退 all_notifications
+        全表扫描——索引是性能优化，非正确性依赖。
+        """
+        rows = self._range_all(
+            NOTIFICATION_INDEX_NAME,
+            ["patient_id", "notification_id"],
+            prefix={"patient_id": patient_id},
+        )
+        return [self._deserialize_notification(item["attrs"]) for item in rows]
+
+    def ensure_notification_index(self) -> None:
+        """幂等创建通知表 patient_id 全局二级索引。
+
+        仅 Tablestore 后端调用（json 后端无索引概念）。索引已存在/创建失败由
+        调用方 ensure_tablestore_tables 兜底（不阻断启动），查询层自动回退全表。
+        """
+        from tablestore import IndexMeta, IndexType
+
+        meta = IndexMeta(
+            NOTIFICATION_INDEX_NAME,
+            primary_key=["patient_id", "notification_id"],
+            defined_columns=[],
+            index_type=IndexType.GLOBAL_INDEX,
+        )
+        self._get_client().create_index(TABLE_NOTIFICATION, meta)
+
 
 # ---------------------------------------------------------------------------
 # 工厂
@@ -388,6 +433,13 @@ def ensure_tablestore_tables() -> None:
         TABLE_FOLLOWUP: [("patient_id", "STRING")],
         TABLE_NOTIFICATION: [("notification_id", "STRING")],
     })
+    # BUG-66（2026-08-21）：通知表 patient_id 全局二级索引（按患者查通知避免
+    # 全表扫描）。索引创建**非启动关键路径**：已存在/权限不足/SDK 异常一律
+    # 忽略并告警，查询层（core.get_notifications）自动回退全表扫描，不影响可用性。
+    try:
+        TablestoreRepository().ensure_notification_index()
+    except Exception as exc:  # noqa: BLE001 防御：索引缺失不阻断建表与启动
+        logger.warning("[ensure] 通知二级索引创建跳过（查询将回退全表扫描）：%s", exc)
 
 
 
@@ -413,6 +465,7 @@ __all__ = [
     "FOLLOWUP_DATA_DIR_ENV",
     "FOLLOWUP_STORE_FILENAME",
     "NOTIFICATION_DATA_DIR_ENV",
+    "NOTIFICATION_INDEX_NAME",
     "NOTIFICATION_STORE_FILENAME",
     "STORAGE_BACKEND_ENV",
     "TABLE_FOLLOWUP",

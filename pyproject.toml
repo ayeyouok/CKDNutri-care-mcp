@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "CKDNutri-care-mcp"
-version = "0.4.29"
+version = "0.4.30"
 description = "P3 随访沟通域——随访+通知+闭环工单"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0",
     "pydantic>=2",
-    "a207-policy>=0.3.49",
+    "a207-policy>=0.3.53",
     "tablestore>=6.4",
 ]
 

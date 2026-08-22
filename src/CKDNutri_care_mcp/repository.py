@@ -376,14 +376,17 @@ class TablestoreRepository(TablestoreBase):
         # 全被误判为"数据已存在（DUPLICATE）"，真实故障被静默吞掉（调用方收到
         # DUPLICATE 会停止重试，通知可能永远缺失）。判定收敛到公共函数
         # is_condition_conflict（与 _save_row_locked 共用，口径一致）。
-        from tablestore import OTSClientError
+        # BUG-69 修复（2026-08-22）：except 扩为 SDK 异常基类 OTSError——SDK 6.4.8
+        # 条件写失败（EXPECT_NOT_EXIST 主键已存在 → ConditionCheckFail）抛的是
+        # OTSServiceError 而非 OTSClientError，此前漏捕 → DUPLICATE 幂等去重从未生效。
+        from tablestore import OTSError
 
         attrs = self._serialize_notification(rec)
         try:
             self._put_row_not_exist(
                 TABLE_NOTIFICATION, self._pk_nid(notification_id), attrs)
             return True
-        except OTSClientError as exc:
+        except OTSError as exc:
             if is_condition_conflict(exc):
                 return False  # 主键已存在（同事件通知已创建）→ 幂等去重命中
             raise  # 网络/超时/鉴权/表不存在等环境问题 → 继续抛，不得误判 DUPLICATE
